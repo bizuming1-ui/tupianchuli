@@ -1,8 +1,14 @@
-transformers>=4.49,<5
+transformers>=4.51,<5
 accelerate
 fastapi
 uvicorn[standard]
 python-multipart
 pillow
+numpy
 pyngrok
+# --- v2.0 辅助检测工具（可选，缺失时自动降级）---
+onnxruntime
+nudenet
+rapidocr_onnxruntime
+# opencv：Kaggle 自带 opencv-python；本地环境请 pip install opencv-python-headless
 # torch 使用 Kaggle 自带版本，不要重装

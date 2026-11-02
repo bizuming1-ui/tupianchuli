@@ -1,12 +1,12 @@
 # ===== ★ 一键运行（推荐）：写入文件 → 安装依赖 → 启动 GPU 服务 → 生成公网网址 =====
 # 前置：Notebook 右侧 Settings → Accelerator 选 GPU T4 x2；Internet 打开 On
-# 只需要把这一整段粘贴到 1 个 Cell 里，点运行即可。（v2.1：双分类器 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL，带自检回退；新增 自动爬取并审查网络照片）
+# 只需要把这一整段粘贴到 1 个 Cell 里，点运行即可。（v2.2：双分类器 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL，带自检回退；自动爬取以【视频抽帧】为主并过滤登录墙；新增「生成 Excel」）
 import os
 APP_DIR = "/kaggle/working/app"
 os.makedirs(APP_DIR, exist_ok=True)
 _FILES = {
 "server.py": r'''"""
-图片审查系统 v2.1 - Kaggle GPU 服务端 (FastAPI)
+图片审查系统 v2.2 - Kaggle GPU 服务端 (FastAPI)
 
 设计要点（第一性原则：吞吐 = GPU 利用率 × 并行度；准确率 = 多信号交叉验证 × 区域级覆盖）
 1. T4 x2：每张 GPU 各加载一份完整模型副本（数据并行），请求由空闲副本抢占处理。
@@ -25,6 +25,8 @@ _FILES = {
 5. 环境变量 MOCK=1 时不加载任何模型，仅用于接口联调。
 6. v2.1 新增「自动爬取并审核网络照片」（crawler.py）：Playwright 无头浏览器抓图/截图（抖音、小红书、微博、B站、百度/必应图片、任意网址），
    抓到即审，流水线并发数 = 副本数x3，两张 T4 同时满载。接口：POST /api/crawl/start、GET /api/crawl/{id}、POST /api/crawl/{id}/stop。
+7. v2.2：爬取以【视频画面】为主（videoframes.py：公开解析器/yt-dlp/抓包 → ffmpeg 抽帧 → 每帧送审），自动识别并排除「登录墙」截图；
+   新增「生成 Excel」：GET /api/crawl/{id}/xlsx、POST /api/export/xlsx（report.py，含缩略图 + 涉政/涉黄/暴力等违规类别 + 汇总）。
 
 环境变量:
   PORT(8000)  PROFILE=fast|balanced|max   (balanced 默认；max=7B 两卡切分)
@@ -53,7 +55,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageDraw, ImageOps
 
 try:  # v2.1 爬取模块：缺失或异常只会让爬取功能不可用，不影响审核主流程
@@ -62,11 +64,17 @@ except Exception as _e:  # noqa: BLE001
     crawler = None  # type: ignore
     print("crawler 模块加载失败（爬取功能不可用）:", _e)
 
+try:  # v2.2 Excel 报告：缺失（或缺 openpyxl）只影响「生成 Excel」，不影响审核
+    import report
+except Exception as _re:  # noqa: BLE001
+    report = None  # type: ignore
+    print("report 模块加载失败（生成 Excel 不可用）:", _re)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("moderation")
 
 BASE_DIR = Path(__file__).resolve().parent
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 MOCK = os.getenv("MOCK") == "1"
 PROFILE = os.getenv("PROFILE", "balanced").lower()
 MAX_BYTES = 40 * 1024 * 1024
@@ -1448,6 +1456,45 @@ async def crawl_image(job_id: str, kind: str, idx: int):
     return FileResponse(str(p), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 
+def _xlsx_response(data: bytes, name: str) -> Response:
+    from urllib.parse import quote
+
+    return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename=\"report.xlsx\"; filename*=UTF-8''%s" % quote(name),
+                             "Cache-Control": "no-store"})
+
+
+@app.get("/api/crawl/{job_id}/xlsx")
+async def crawl_xlsx(job_id: str, include_wall: int = 0) -> Response:
+    """爬取任务结果 → Excel（每行一张图的缩略图 + 结论 + 违规类别 + 汇总）"""
+    j = _job(job_id)
+    if report is None:
+        raise HTTPException(501, "Excel 模块未加载（缺少 kaggle/report.py 或 openpyxl）")
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(None, lambda: crawler.export_xlsx(j, bool(include_wall)))  # type: ignore[union-attr]
+    except Exception as e:  # noqa: BLE001
+        log.exception("生成 Excel 失败")
+        raise HTTPException(500, "生成 Excel 失败: %s" % str(e)[:200])
+    return _xlsx_response(data, "爬取审核报告-%s.xlsx" % time.strftime("%Y%m%d-%H%M%S"))
+
+
+@app.post("/api/export/xlsx")
+async def export_xlsx(body: Dict[str, Any]) -> Response:
+    """图片审核页：前端把 {title, rows:[{name, image(dataURL), res, kind, ...}]} 交过来，服务端生成 Excel"""
+    if report is None:
+        raise HTTPException(501, "Excel 模块未加载（缺少 kaggle/report.py 或 openpyxl）")
+    rows = report.rows_from_payload(body)
+    if not rows:
+        raise HTTPException(400, "没有可导出的审核结果")
+    meta = {"title": str(body.get("title") or "图片智能审查报告"), "mode": ""}
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(None, lambda: report.build_xlsx(rows, meta))
+    except Exception as e:  # noqa: BLE001
+        log.exception("生成 Excel 失败")
+        raise HTTPException(500, "生成 Excel 失败: %s" % str(e)[:200])
+    return _xlsx_response(data, "图片审核报告-%s.xlsx" % time.strftime("%Y%m%d-%H%M%S"))
+
+
 @app.get("/crawl")
 async def crawl_page():
     p = BASE_DIR / "crawl.html"
@@ -1470,10 +1517,16 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), log_level="warning")
 ''',
 "crawler.py": r'''"""
-网络照片「自动爬取 + 截图 + 精准审核」模块 v2.1（与 server.py 配合，不改动原有审核逻辑）
+网络照片「自动爬取 + 视频抽帧 + 精准审核」模块 v2.2（与 server.py 配合，不改动原有审核逻辑）
 
 第一性原则：吞吐 = 抓取速度 × GPU 利用率。所以抓取与审核做成【流水线】：
   抓到一张 → 立刻去重 → 立刻丢给 GPU 池审核（两张 T4 同时抢活）→ 前端实时看到结果。
+
+v2.2 重点修复：旧版抓到的几乎全是「需要登录」的图（登录二维码 / 登录弹窗截图 / 头像 / 图标）。现在：
+  A) 【视频优先】默认模式 video：找到视频流（公开解析器 / yt-dlp / 网络抓包 / <video>）→ ffmpeg 抽帧 → 每帧送 GPU 审核（videoframes.py）
+  B) 【登录墙过滤】三层：界面类图片地址不要 → 页面被登录/验证码墙遮住时不截图（先尝试像用户一样关掉弹窗）
+     → 审核完成后再按「OCR 文字 + 大模型描述 + 二维码」识别登录墙截图，标记为 wall 并排除出统计
+  C) 【Cookie 多格式】请求头 a=1;b=2 / Cookie-Editor JSON / Netscape cookies.txt，只用于使用者自己的账号，仅内存使用
 
 抓取三条腿（互相补充，任何一条失败都只会降级）：
   1) 网络响应拦截：浏览器加载页面时，直接截获所有 image/* 响应的字节（不用二次下载，天然绕开防盗链/签名过期）
@@ -1508,6 +1561,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
+
+try:  # v2.2 视频抽帧模块：缺失只会让「视频抽帧」不可用，图片/截图爬取照常
+    import videoframes
+except Exception as _ve:  # noqa: BLE001
+    videoframes = None  # type: ignore
+    print("videoframes 模块加载失败（视频抽帧不可用）:", _ve)
 
 log = logging.getLogger("crawler")
 
@@ -1581,17 +1640,19 @@ def _registrable(host: str) -> str:
 
 
 def parse_cookies(raw: str, url: str) -> List[Dict[str, Any]]:
+    """支持：请求头 a=1; b=2 / Cookie-Editor JSON / Netscape cookies.txt（v2.2）。没写域名的 Cookie 默认挂到该网址的主域名上"""
     host = urllib.parse.urlparse(url).hostname or ""
     dom = "." + _registrable(host) if "." in host else host
-    out = []
-    for part in (raw or "").split(";"):
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if k:
-            out.append({"name": k, "value": v, "domain": dom, "path": "/"})
-    return out
+    if videoframes:
+        out = videoframes.parse_cookie_text(raw, dom)
+    else:
+        out = []
+        for part in (raw or "").split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.strip():
+                    out.append({"name": k.strip(), "value": v.strip(), "domain": dom, "path": "/"})
+    return [c for c in out if c.get("domain")]
 
 
 def _host_is_public(host: str) -> bool:
@@ -1622,7 +1683,10 @@ def capabilities() -> Dict[str, Any]:
     pw = importlib.util.find_spec("playwright") is not None
     base = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH") or (Path.home() / ".cache" / "ms-playwright"))
     chromium = pw and base.exists() and any(base.glob("chromium*"))
+    vf = videoframes.capabilities() if videoframes else {"ffmpeg": False, "ytdlp": False, "cv2": False}
+    chrome = bool(shutil.which("google-chrome") or shutil.which("google-chrome-stable") or Path("/opt/google/chrome/chrome").exists())
     return {"playwright": pw, "chromium": bool(chromium), "engine": "playwright" if chromium else "http",
+            "chrome": chrome, "video": bool(videoframes) and (vf["ffmpeg"] or vf["cv2"]), "ffmpeg": vf["ffmpeg"], "ytdlp": vf["ytdlp"],
             "platforms": {k: v["name"] for k, v in PLATFORMS.items()}}
 
 
@@ -1645,7 +1709,7 @@ def _prepare(raw: bytes, kind: str, min_size: int) -> Optional[Tuple[int, int, b
     try:
         img = Image.open(io.BytesIO(raw))
         w, h = img.size
-        if kind == "image":
+        if kind in ("image", "cover"):
             if min(w, h) < min_size or w * h < min_size * min_size:
                 return None
             if max(w, h) / max(1, min(w, h)) > 8:
@@ -1699,7 +1763,15 @@ class Job:
         self.dir = CRAWL_DIR / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.stats: Dict[str, int] = {"pages": 0, "found": 0, "screenshots": 0, "analyzed": 0, "errors": 0,
-                                      "dup": 0, "small": 0, "pass": 0, "review": 0, "block": 0}
+                                      "dup": 0, "small": 0, "pass": 0, "review": 0, "block": 0,
+                                      # v2.2：视频帧 / 视频数 / 抽帧失败 / 被识别为登录墙而排除 / 遮住的页面 / 被跳过的截图 / 界面图
+                                      "frames": 0, "videos": 0, "video_fail": 0, "walls": 0, "wall_pages": 0, "wall_skip": 0, "ui": 0}
+        self.cookies: List[Dict[str, Any]] = videoframes.parse_cookie_text(params.get("cookie", ""), "") if (videoframes and params.get("cookie")) else []
+        self.vsem = asyncio.Semaphore(2)  # 同时抽帧的视频数（ffmpeg 吃 CPU，2 个刚好不拖慢 GPU 喂图）
+        self.seen_video: "set[str]" = set()
+        self.ytdlp_tried: "set[str]" = set()
+        self.cand_total = 0
+        self.video_cap_hit = False
         self.gpu_count: Dict[str, int] = {}
         self.cap_hit = False
 
@@ -1712,6 +1784,11 @@ class Job:
     def touch(self, item: Dict[str, Any]) -> None:
         self.rev += 1
         item["rev"] = self.rev
+
+    def cookie_header(self, url: str) -> str:
+        if not self.cookies or not videoframes:
+            return ""
+        return videoframes.cookie_header_for(self.cookies, url)
 
     @property
     def pending(self) -> int:
@@ -1735,9 +1812,14 @@ async def _analyze_item(job: Job, item: Dict[str, Any]) -> None:
             item["status"] = "done"
             item["ms"] = int((time.time() - t0) * 1000)
             job.stats["analyzed"] += 1
-            v = res.get("verdict")
-            if v in ("pass", "review", "block"):
-                job.stats[v] += 1
+            if looks_like_wall(res, str(item.get("kind"))):
+                # 登录/验证码墙截图：不是内容，不计入 拦截/复核/通过（前端单独放在「登录墙」页签，Excel 不导出）
+                item["wall"] = True
+                job.stats["walls"] += 1
+            else:
+                v = res.get("verdict")
+                if v in ("pass", "review", "block"):
+                    job.stats[v] += 1
             g = str(res.get("gpu") or "?")
             job.gpu_count[g] = job.gpu_count.get(g, 0) + 1
         except Exception as e:  # noqa: BLE001
@@ -1756,7 +1838,7 @@ def _name_from_url(u: str) -> str:
         return ""
 
 
-async def ingest(job: Job, raw: bytes, kind: str, src: str, page_url: str) -> bool:
+async def ingest(job: Job, raw: bytes, kind: str, src: str, page_url: str, extra: Optional[Dict[str, Any]] = None) -> bool:
     """一张候选图片进入流水线：过滤 → 去重 → 落盘 → 异步审核。返回是否被接收"""
     if job.stop.is_set() or len(job.items) >= job.p["max_images"]:
         job.cap_hit = len(job.items) >= job.p["max_images"]
@@ -1780,8 +1862,8 @@ async def ingest(job: Job, raw: bytes, kind: str, src: str, page_url: str) -> bo
         if len(job.items) >= job.p["max_images"]:
             job.cap_hit = True
             return False
-        # 截图只做 SHA1 精确去重（文字密集页面滚动前后的低分辨率哈希很接近，用近似去重会漏检）；图片用感知哈希去近似重复
-        if kind == "image":
+        # 截图只做 SHA1 精确去重（文字密集页面滚动前后的低分辨率哈希很接近，用近似去重会漏检）；图片/封面/视频帧用感知哈希去近似重复
+        if kind in ("image", "cover", "frame"):
             if any(_popcount(dh ^ o) <= 2 for o in job.dhashes):
                 job.stats["dup"] += 1
                 return False
@@ -1789,14 +1871,17 @@ async def ingest(job: Job, raw: bytes, kind: str, src: str, page_url: str) -> bo
         idx = len(job.items)
         item: Dict[str, Any] = {
             "idx": idx, "kind": kind, "src": src[:600], "page": page_url[:600], "w": w, "h": h, "bytes": len(raw),
-            "name": ("截图-%03d.jpg" % idx) if kind == "screenshot" else (_name_from_url(src) or "img-%03d.jpg" % idx),
+            "name": (extra or {}).get("name") or (("截图-%03d.jpg" % idx) if kind == "screenshot" else (_name_from_url(src) or "img-%03d.jpg" % idx)),
             "status": "queued", "t": round(time.time() - job.created, 1),
         }
+        for k2, v2 in (extra or {}).items():
+            if k2 != "name":
+                item[k2] = v2
         # 先落盘再公开：前端一旦看到这一项，缩略图一定已经可以读取
         await asyncio.to_thread((job.dir / ("%d.jpg" % idx)).write_bytes, full)
         await asyncio.to_thread((job.dir / ("%d_t.jpg" % idx)).write_bytes, thumb)
         job.items.append(item)
-        job.stats["found" if kind == "image" else "screenshots"] += 1
+        job.stats["frames" if kind == "frame" else "screenshots" if kind == "screenshot" else "found"] += 1
         job.touch(item)
     t = asyncio.create_task(_analyze_item(job, item))
     job.tasks.add(t)
@@ -1805,7 +1890,7 @@ async def ingest(job: Job, raw: bytes, kind: str, src: str, page_url: str) -> bo
 
 
 # --------------------------------------------------------------------------
-# 抓取：Playwright 模式
+# 抓取公共脚本（JS）
 # --------------------------------------------------------------------------
 WALL_RE = re.compile(r"验证码|安全验证|滑动验证|人机验证|captcha|are you a robot|verify you are human|请先登录|扫码登录", re.I)
 
@@ -1826,10 +1911,319 @@ JS_COLLECT = """() => {
 JS_LINKS = "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)"
 
 
+# --------------------------------------------------------------------------
+# v2.2：登录墙 / 界面图过滤 + 视频流 → 帧
+# --------------------------------------------------------------------------
+# 强信号：出现这些词基本可以确定是登录/验证码墙（单独一个「登录」按钮不算，导航栏里到处都有）
+STRONG_WALL_RE = re.compile(r"验证码|安全验证|滑动验证|人机验证|captcha|are you a robot|verify you are human|请先登录|扫码登录|登录后(?:查看|可见|继续|才能)|log ?in to continue", re.I)
+# 界面类图片地址（二维码 / 登录 / 头像 / 图标 / 表情 …）：不是内容，直接不要
+UI_URL_RE = re.compile(r"qrcode|qr_code|/qr/|login|passport|captcha|avatar|favicon|/logo|sprite|emoji|emoticon|/icons?/|badge|placeholder|default[-_]?(?:avatar|head)", re.I)
+# 审核完成后的「登录墙截图」识别：OCR 文字 + 大模型描述 + 二维码，多信号累计
+WALL_WORDS = ("登录", "扫码", "验证码", "手机号", "密码登录", "获取验证码", "用户协议", "隐私政策", "未注册", "自动注册", "立即登录",
+              "请先登录", "安全验证", "人机验证", "滑动验证", "打开抖音", "打开小红书", "打开微博", "下载app", "下载APP")
+WALL_DESC_RE = re.compile(r"登录(?:界面|页面|窗口|弹窗|框)|扫码登录|二维码登录|(?:登录|验证)(?:页|界面)|安全验证|login (?:page|screen|prompt|window)|sign[- ]?in (?:page|screen)|captcha", re.I)
+
+
+def looks_like_wall(res: Dict[str, Any], kind: str) -> bool:
+    """审核结果是不是「登录/验证码墙」截图。视频帧门槛更高（视频里偶尔出现的「登录」字样不能误杀）"""
+    text = str(res.get("ocr_text") or "")
+    score = sum(1 for w in WALL_WORDS if w in text)
+    if WALL_DESC_RE.search(str(res.get("description") or "")):
+        score += 2
+    if (res.get("aux") or {}).get("qr"):
+        score += 1
+    return score >= (3 if kind == "frame" else 2)
+
+
+JS_WALL = r"""() => {
+  const vw = innerWidth, vh = innerHeight;
+  const text = ((document.body && document.body.innerText) || '').slice(0, 1500);
+  let modal = false;
+  const sel = '[role="dialog"],[class*="login" i],[id*="login" i],[class*="passport" i],[class*="captcha" i],[class*="verify" i],[class*="modal" i],[class*="mask" i],[class*="popup" i]';
+  for (const el of document.querySelectorAll(sel)) {
+    const r = el.getBoundingClientRect();
+    if (r.width * r.height < vw * vh * 0.1) continue;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) continue;
+    const t = (el.innerText || '').slice(0, 800);
+    if (/登录|扫码|验证码|验证|captcha|sign in|log in/i.test(t)) { modal = true; break; }
+  }
+  return { text, modal };
+}"""
+
+JS_CLOSE_MODAL = r"""() => {
+  const vh = innerHeight; let n = 0;
+  for (const el of document.querySelectorAll('[class*="close" i],[aria-label*="关闭"],[aria-label*="close" i]')) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8 || r.width > 120 || r.height > 120 || r.bottom < 0 || r.top > vh) continue;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    const box = el.closest('[role="dialog"],[class*="login" i],[class*="modal" i],[class*="mask" i],[class*="popup" i],[id*="login" i]');
+    if (!box || !/登录|扫码|验证码|login/i.test(box.innerText || '')) continue;
+    try { el.click(); n++; } catch (e) {}
+    if (n >= 2) break;
+  }
+  return n;
+}"""
+
+JS_VIDEOS = r"""() => {
+  const out = [];
+  const add = (u, p) => { if (!u || /^(blob|data|javascript):/i.test(u)) return; try { out.push({ url: new URL(u, location.href).href, poster: p || '' }); } catch (e) {} };
+  document.querySelectorAll('video').forEach(v => {
+    const p = v.poster || '';
+    add(v.currentSrc, p); add(v.src, p);
+    v.querySelectorAll('source').forEach(s => add(s.src, p));
+  });
+  document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"]').forEach(m => add(m.content, ''));
+  return out;
+}"""
+
+JS_AUTOPLAY = "() => { document.querySelectorAll('video').forEach(v => { try { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {} }); }"
+
+SHORT_HOSTS = ("v.douyin.com", "xhslink.com", "b23.tv", "m.weibo.cn", "www.iesdouyin.com", "iesdouyin.com")
+
+
+def is_content_url(url: str) -> bool:
+    """这个网址本身是不是「一个具体作品」（而不是搜索页/主页/列表）。作品页不需要再「深入」"""
+    p = urllib.parse.urlparse(url)
+    host = (p.hostname or "").lower()
+    if host in SHORT_HOSTS:
+        return True
+    plat = detect_platform(url)
+    rule = PLATFORMS[plat]["links"]
+    if plat == "custom" or not rule:
+        return False
+    if re.search(r"search|keyword|/s\?|/user/|/u/|space\.bilibili", url, re.I) and not re.search(r"/(video|note|detail|status)/|BV\w{10}", url, re.I):
+        return False
+    return bool(re.search(rule, url))
+
+
+def _bad_jpeg(raw: bytes) -> bool:
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        return bool(videoframes and videoframes._bad_frame(img))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return True
+
+
+async def _page_wall(page: Any) -> bool:
+    """当前页面是否被登录/验证码墙遮住（只检测，不绕过）"""
+    try:
+        if re.search(r"/(?:login|passport|signin|sso)(?:[/?#.]|$)", urllib.parse.urlparse(page.url).path, re.I):
+            return True
+        r = await page.evaluate(JS_WALL)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(r.get("modal")) or bool(STRONG_WALL_RE.search(r.get("text") or ""))
+
+
+async def _clear_wall(job: Job, page: Any) -> bool:
+    """被遮住时先尝试关闭弹窗（Esc / 点关闭按钮，等同于用户手动点 ✕）；仍然遮住返回 True。不会填账号、不会破解验证码"""
+    if not await _page_wall(page):
+        return False
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(500)
+        await page.evaluate(JS_CLOSE_MODAL)
+        await page.wait_for_timeout(700)
+    except Exception:  # noqa: BLE001
+        pass
+    if not await _page_wall(page):
+        job.say("已关闭页面弹窗，继续抓取")
+        return False
+    return True
+
+
+class VideoCandidates:
+    """一个页面里发现的视频流地址（网络抓包 + JSON 挖掘 + DOM）"""
+
+    def __init__(self, job: Job) -> None:
+        self.job = job
+        self.items: Dict[str, Dict[str, str]] = {}
+        self.done: "set[str]" = set()
+
+    def add(self, url: str, referer: str, cover: str = "") -> None:
+        if not url or not videoframes or url.startswith(("blob:", "data:")) or len(url) > 2000:
+            return
+        k = videoframes.norm_key(url)
+        if k in self.items:
+            if cover and not self.items[k].get("cover"):
+                self.items[k]["cover"] = cover
+            return
+        self.items[k] = {"url": url, "referer": referer, "cover": cover}
+        self.job.cand_total += 1
+
+    async def add_dom(self, page: Any) -> None:
+        try:
+            arr = await page.evaluate(JS_VIDEOS)
+        except Exception:  # noqa: BLE001
+            return
+        for v in arr or []:
+            self.add(v.get("url", ""), page.url, v.get("poster", ""))
+
+
+async def ingest_video(job: Job, info: Dict[str, Any], page_url: str) -> int:
+    """
+    一个视频（已解析出流地址）→ 抽帧 → 每一帧立刻进入审核流水线（两张 T4 同时抢活）。返回入审的帧数/图数。
+    info: url(视频流，可为空：图集) · headers · cover · title · images[] · via
+    """
+    if not videoframes or job.stop.is_set() or len(job.items) >= job.p["max_images"]:
+        return 0
+    got = 0
+    title = str(info.get("title") or "")[:80]
+    headers = dict(info.get("headers") or {})
+    url = str(info.get("url") or "")
+    vno = 0
+    if url:
+        key = videoframes.norm_key(url)
+        if key in job.seen_video:
+            return 0
+        if job.stats["videos"] >= job.p["video_limit"]:
+            job.video_cap_hit = True
+            return 0
+        job.seen_video.add(key)
+        try:
+            await check_url(url)
+        except ValueError as e:
+            job.say("跳过视频：%s" % str(e)[:100])
+            return 0
+        job.stats["videos"] += 1
+        vno = job.stats["videos"]
+        if "Cookie" not in headers and job.cookies:
+            ck = videoframes.cookie_header_for(job.cookies, url)
+            if ck:
+                headers["Cookie"] = ck
+        job.say("🎬 视频 #%d（%s）%s：开始抽取 %d 帧" % (vno, info.get("via") or "页面抓包", title or url[:70], job.p["frames_per_video"]))
+        try:
+            async with job.vsem:
+                frames, note = await asyncio.wait_for(
+                    asyncio.to_thread(videoframes.extract_frames, url, headers, job.p["frames_per_video"]), timeout=300)
+        except Exception as e:  # noqa: BLE001
+            frames, note = [], "抽帧超时/异常：%s" % str(e)[:80]
+        if not frames:
+            job.stats["video_fail"] += 1
+            job.say("⚠️ 视频 #%d 没有取到画面：%s" % (vno, note))
+        for ts, jpg in frames:
+            if await ingest(job, jpg, "frame", url, page_url, {"vid": vno, "ts": ts, "title": title, "video": url[:600],
+                                                                "name": "视频%02d-%05.1fs.jpg" % (vno, ts)}):
+                got += 1
+        if frames:
+            job.say("✅ 视频 #%d：%s，送审 %d 帧" % (vno, note, got))
+    cover = str(info.get("cover") or "")
+    if cover.startswith("//"):
+        cover = "https:" + cover
+    if cover.startswith("http") and not job.stop.is_set():
+        try:
+            await check_url(cover)
+            raw = await asyncio.to_thread(videoframes.fetch_bytes, cover, {"User-Agent": UA_DESKTOP, "Referer": page_url})
+            if raw:
+                await ingest(job, raw, "cover", cover, page_url, {"vid": vno, "title": title, "name": "视频%02d-封面.jpg" % vno if vno else "封面.jpg"})
+        except Exception:  # noqa: BLE001
+            pass
+    for i, iu in enumerate((info.get("images") or [])[:9]):  # 图集作品：每张图就是内容
+        if job.stop.is_set():
+            break
+        try:
+            await check_url(iu)
+            raw = await asyncio.to_thread(videoframes.fetch_bytes, iu, {"User-Agent": UA_DESKTOP, "Referer": page_url})
+            if raw and await ingest(job, raw, "image", iu, page_url, {"title": title}):
+                got += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return got
+
+
+async def video_direct(job: Job, url: str) -> int:
+    """作品链接 → 公开解析器（抖音/B站）→ yt-dlp → 抽帧入审。不需要打开浏览器页面，速度最快。失败返回 0"""
+    if not videoframes or job.stop.is_set():
+        return 0
+    plat = detect_platform(url)
+    info: Optional[Dict[str, Any]] = None
+    try:
+        if plat == "douyin" or urllib.parse.urlparse(url).hostname in ("v.douyin.com", "www.iesdouyin.com", "iesdouyin.com"):
+            info = await asyncio.to_thread(videoframes.douyin_resolve, url)
+        elif plat == "bilibili":
+            info = await asyncio.to_thread(videoframes.bilibili_resolve, url)
+        if not info and job.p["use_ytdlp"] and videoframes.has_ytdlp() and plat != "custom":
+            job.ytdlp_tried.add(url)
+            info = await asyncio.wait_for(asyncio.to_thread(videoframes.ytdlp_resolve, url, job.cookies, job.p["mobile"]), timeout=90)
+    except Exception as e:  # noqa: BLE001
+        job.say("解析作品失败：%s" % str(e)[:80])
+        info = None
+    if not info:
+        return 0
+    return await ingest_video(job, info, url)
+
+
+async def process_candidates(job: Job, vc: VideoCandidates, page_url: str) -> int:
+    """把页面里发现的视频流逐个抽帧入审（受 video_limit 限制）"""
+    got = 0
+    ua = UA_MOBILE if job.p["mobile"] else UA_DESKTOP
+    for k, c in list(vc.items.items()):
+        if k in vc.done:
+            continue
+        if job.stop.is_set() or len(job.items) >= job.p["max_images"] or job.stats["videos"] >= job.p["video_limit"]:
+            break
+        vc.done.add(k)
+        ref = c.get("referer") or page_url
+        pu = urllib.parse.urlparse(ref)
+        headers = {"User-Agent": ua, "Referer": "%s://%s/" % (pu.scheme or "https", pu.netloc)}
+        got += await ingest_video(job, {"url": c["url"], "headers": headers, "cover": c.get("cover", ""), "via": "页面抓包"}, page_url)
+    return got
+
+
+async def element_shots(job: Job, page: Any, n: int) -> int:
+    """兜底：浏览器能解码时，直接给页面里正在播放的 <video> 截图（Chrome 通道支持 H.264；纯 Chromium 可能是黑屏，会被自动丢弃）"""
+    got = 0
+    try:
+        handles = await page.query_selector_all("video")
+    except Exception:  # noqa: BLE001
+        return 0
+    for h in handles[:3]:
+        if job.stop.is_set() or len(job.items) >= job.p["max_images"]:
+            break
+        try:
+            box = await h.bounding_box()
+            if not box or box["width"] < 160 or box["height"] < 90:
+                continue
+            await h.scroll_into_view_if_needed(timeout=2500)
+            await page.evaluate("(v) => { v.muted = true; if (v.play) v.play().catch(() => {}); }", h)
+            if job.stats["videos"] >= job.p["video_limit"]:
+                break
+            job.stats["videos"] += 1
+            vno = job.stats["videos"]
+            job.say("🎬 视频 #%d（浏览器播放截图）：每 1.2 秒截取一帧" % vno)
+            ok = 0
+            for k in range(n):
+                await page.wait_for_timeout(1200)
+                if await _page_wall(page):
+                    break
+                png = await h.screenshot(type="jpeg", quality=88, timeout=6000)
+                if await asyncio.to_thread(_bad_jpeg, png):
+                    continue
+                if await ingest(job, png, "frame", page.url, page.url, {"vid": vno, "ts": round((k + 1) * 1.2, 1), "video": page.url[:600],
+                                                                         "name": "视频%02d-播放截图%d.jpg" % (vno, k + 1)}):
+                    ok += 1
+            got += ok
+            if ok == 0:
+                job.stats["video_fail"] += 1
+                job.say("⚠️ 视频 #%d 播放截图是黑屏（浏览器不支持该视频编码）。运行 Cell 1 安装 Chrome 可解决" % vno)
+        except Exception as e:  # noqa: BLE001
+            job.say("视频截图失败：%s" % str(e)[:80])
+    return got
+
+
+# --------------------------------------------------------------------------
+# 抓取：Playwright 模式
+# --------------------------------------------------------------------------
 async def _download(job: Job, ctx: Any, url: str, referer: str) -> None:
     if url in job.seen_url or job.stop.is_set() or len(job.items) >= job.p["max_images"]:
         return
     job.seen_url.add(url)
+    if UI_URL_RE.search(url):
+        job.stats["ui"] += 1
+        return
     try:
         await check_url(url)
         r = await ctx.request.get(url, headers={"Referer": referer}, timeout=15000)
@@ -1858,24 +2252,42 @@ async def _collect_dom(job: Job, page: Any, ctx: Any) -> int:
 
 async def _shot(job: Job, page: Any) -> None:
     try:
+        if await _clear_wall(job, page):  # 被登录/验证码墙遮住：不截（截出来只会是登录框）
+            job.stats["wall_skip"] += 1
+            return
         png = await page.screenshot(type="jpeg", quality=88, full_page=False)
         await ingest(job, png, "screenshot", page.url, page.url)
     except Exception as e:  # noqa: BLE001
         job.say("截图失败：%s" % str(e)[:80])
 
 
-def _attach(job: Job, page: Any, bg: "set[asyncio.Task]") -> None:
+def _attach(job: Job, page: Any, bg: "set[asyncio.Task]", vc: Optional[VideoCandidates] = None) -> None:
     async def on_response(resp: Any) -> None:
         try:
-            if job.stop.is_set() or resp.status != 200:
+            if job.stop.is_set() or resp.status not in (200, 206):
                 return
             ct = (resp.headers.get("content-type") or "").lower()
+            u = resp.url
+            if vc is not None and videoframes:
+                if videoframes.is_media_response(ct, u):  # 视频流：只记地址，不读内容
+                    vc.add(u, page.url)
+                    return
+                if resp.status == 200 and ("json" in ct or "html" in ct or "javascript" in ct):  # 接口/页面里常埋着视频地址
+                    body = await resp.body()
+                    if len(body) <= 3_000_000:
+                        for mu in videoframes.mine_video_urls(body.decode("utf-8", "ignore"), u):
+                            vc.add(mu, page.url)
+                    return
+            if resp.status != 200 or not job.p.get("grab_images", True):
+                return
             if not ct.startswith("image/") or "svg" in ct or "icon" in ct:
                 return
-            u = resp.url
             if u in job.seen_url or len(job.items) >= job.p["max_images"]:
                 return
             job.seen_url.add(u)
+            if UI_URL_RE.search(u):
+                job.stats["ui"] += 1
+                return
             body = await resp.body()
             await ingest(job, body, "image", u, page.url)
         except Exception:  # noqa: BLE001
@@ -1889,13 +2301,15 @@ def _attach(job: Job, page: Any, bg: "set[asyncio.Task]") -> None:
     page.on("response", handler)
 
 
-async def _scroll_capture(job: Job, page: Any, ctx: Any, rounds: int, shots: bool, grab: bool) -> None:
+async def _scroll_capture(job: Job, page: Any, ctx: Any, rounds: int, shots: bool, grab: bool, vc: Optional[VideoCandidates] = None) -> None:
     idle = 0
     delay = job.p["delay"]
     for r in range(rounds + 1):
         if job.stop.is_set() or len(job.items) >= job.p["max_images"]:
             break
-        before = len(job.items) + len(job.seen_url)
+        if vc is not None:
+            await vc.add_dom(page)
+        before = len(job.items) + len(job.seen_url) + job.cand_total
         if shots:
             await _shot(job, page)
         if grab:
@@ -1914,17 +2328,17 @@ async def _scroll_capture(job: Job, page: Any, ctx: Any, rounds: int, shots: boo
             await page.wait_for_load_state("networkidle", timeout=2500)
         except Exception:  # noqa: BLE001
             pass
-        after = len(job.items) + len(job.seen_url)
+        after = len(job.items) + len(job.seen_url) + job.cand_total
         idle = idle + 1 if after == before else 0
         if idle >= 3:
             job.say("页面已滚动到底/没有新内容，停止滚动")
             break
 
 
-async def _open(job: Job, ctx: Any, url: str, bg: "set[asyncio.Task]") -> Any:
+async def _open(job: Job, ctx: Any, url: str, bg: "set[asyncio.Task]", vc: Optional[VideoCandidates] = None) -> Any:
     await check_url(url)
     page = await ctx.new_page()
-    _attach(job, page, bg)
+    _attach(job, page, bg, vc)
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     try:
         await page.wait_for_load_state("networkidle", timeout=8000)
@@ -1933,21 +2347,105 @@ async def _open(job: Job, ctx: Any, url: str, bg: "set[asyncio.Task]") -> Any:
     return page
 
 
+async def _collect_links(job: Job, page: Any, url: str) -> List[str]:
+    plat = detect_platform(url)
+    rule = PLATFORMS[plat]["links"] or PLATFORMS["custom"]["links"]
+    try:
+        allv: List[str] = await page.evaluate(JS_LINKS)
+    except Exception:  # noqa: BLE001
+        allv = []
+    base_host = urllib.parse.urlparse(page.url).hostname or ""
+    here = page.url.split("#")[0]
+    links: List[str] = []
+    for l in allv:
+        lh = urllib.parse.urlparse(l).hostname or ""
+        if not l.startswith("http") or l.split("#")[0] == here or not re.search(rule, l):
+            continue
+        if plat == "custom" and _registrable(lh) != _registrable(base_host):
+            continue
+        l = l.split("#")[0]
+        if l not in links:
+            links.append(l)
+    return links[: job.p["deep_limit"]]
+
+
+async def _page_pass(job: Job, ctx: Any, url: str, bg: "set[asyncio.Task]", rounds: int, shots: bool, grab: bool,
+                     vid_mode: bool, want_links: bool) -> List[str]:
+    """打开一个页面：滚动抓取 →（视频模式）收集视频流 → 抽帧入审 → 兜底（yt-dlp / 播放截图）。返回页面里的作品链接"""
+    vc = VideoCandidates(job) if vid_mode else None
+    page = await _open(job, ctx, url, bg, vc)
+    links: List[str] = []
+    try:
+        job.stats["pages"] += 1
+        walled = await _clear_wall(job, page)
+        if walled:
+            job.stats["wall_pages"] += 1
+            job.say("🔒 页面被登录/验证码墙遮住：%s。本系统不会绕过登录，也不会截登录框当内容。"
+                    "请粘贴【具体视频链接】（抖音/B站可直接解析），或在高级选项填入你自己账号的 Cookie" % url[:70])
+        if vid_mode:
+            try:
+                await page.evaluate(JS_AUTOPLAY)
+            except Exception:  # noqa: BLE001
+                pass
+        await _scroll_capture(job, page, ctx, rounds, shots, grab, vc)
+        if want_links:
+            links = await _collect_links(job, page, url)
+        if vc is not None:
+            await vc.add_dom(page)
+            got = await process_candidates(job, vc, page.url)
+            if got == 0 and not links and job.p["use_ytdlp"] and videoframes and videoframes.has_ytdlp() and page.url not in job.ytdlp_tried:
+                job.ytdlp_tried.add(page.url)
+                try:
+                    info = await asyncio.wait_for(asyncio.to_thread(videoframes.ytdlp_resolve, page.url, job.cookies, job.p["mobile"]), timeout=90)
+                except Exception:  # noqa: BLE001
+                    info = None
+                if info:
+                    got += await ingest_video(job, info, page.url)
+            if got == 0 and not links and not walled:
+                got += await element_shots(job, page, min(4, job.p["frames_per_video"]))
+            if got == 0 and not links:
+                job.say("本页没有发现可抽帧的视频%s" % ("（被登录墙遮住）" if walled else ""))
+    finally:
+        try:
+            await page.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return links
+
+
+def _chrome_installed() -> bool:
+    return bool(shutil.which("google-chrome") or shutil.which("google-chrome-stable") or Path("/opt/google/chrome/chrome").exists())
+
+
 async def crawl_playwright(job: Job, urls: List[str]) -> None:
     from playwright.async_api import async_playwright  # 延迟导入：没装也不影响服务启动
 
     job.engine = "playwright"
     mode = job.p["mode"]
-    shots = mode in ("screenshot", "both")
-    grab = mode in ("images", "both")
+    vid_mode = mode in ("video", "all")
+    shots = mode in ("screenshot", "both", "all")
+    grab = mode in ("images", "both", "all")
+    job.p["grab_images"] = grab
     mobile = job.p["mobile"]
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        browser = None
+        if _chrome_installed():  # Google Chrome 带 H.264 解码器，视频截图兜底才有画面；没有就用 Playwright 自带 Chromium
+            try:
+                browser = await pw.chromium.launch(channel="chrome", headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                job.say("浏览器：Google Chrome（支持 H.264）")
+            except Exception:  # noqa: BLE001
+                browser = None
+        if browser is None:
+            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         try:
             for ui, url in enumerate(urls):
                 if job.stop.is_set() or len(job.items) >= job.p["max_images"]:
                     break
                 job.say("(%d/%d) 打开 %s" % (ui + 1, len(urls), url[:100]))
+                content = is_content_url(url)
+                if vid_mode and content:
+                    if await video_direct(job, url) > 0:  # 公开解析器已拿到视频帧：不用再开浏览器
+                        continue
                 kw: Dict[str, Any] = dict(locale="zh-CN", timezone_id="Asia/Shanghai",
                                           extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6"})
                 if mobile:
@@ -1963,46 +2461,19 @@ async def crawl_playwright(job: Job, urls: List[str]) -> None:
                             await ctx.add_cookies(parse_cookies(job.p["cookie"], url))
                         except Exception as e:  # noqa: BLE001
                             job.say("Cookie 格式无法识别，已忽略：%s" % str(e)[:60])
-                    page = await _open(job, ctx, url, bg)
-                    job.stats["pages"] += 1
-                    try:
-                        head = await page.evaluate("document.body ? document.body.innerText.slice(0, 600) : ''")
-                        if WALL_RE.search(head or ""):
-                            job.say("⚠️ 页面出现登录/验证码提示（本系统不会绕过）。可用自己账号的 Cookie 或换公开链接。")
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await _scroll_capture(job, page, ctx, job.p["scrolls"], shots, grab)
-                    if job.p["deep"] and not job.stop.is_set():
-                        plat = detect_platform(url)
-                        rule = PLATFORMS[plat]["links"] or PLATFORMS["custom"]["links"]
-                        try:
-                            allv: List[str] = await page.evaluate(JS_LINKS)
-                        except Exception:  # noqa: BLE001
-                            allv = []
-                        base_host = urllib.parse.urlparse(page.url).hostname or ""
-                        here = page.url.split("#")[0]
-                        links: List[str] = []
-                        for l in allv:
-                            lh = urllib.parse.urlparse(l).hostname or ""
-                            if not l.startswith("http") or l.split("#")[0] == here or not re.search(rule, l):
-                                continue
-                            if plat == "custom" and _registrable(lh) != _registrable(base_host):
-                                continue
-                            l = l.split("#")[0]
-                            if l not in links:
-                                links.append(l)
-                        links = links[: job.p["deep_limit"]]
+                    want_links = (job.p["deep"] or vid_mode) and not content
+                    rounds = min(2, job.p["scrolls"]) if content else job.p["scrolls"]
+                    links = await _page_pass(job, ctx, url, bg, rounds, shots, grab, vid_mode, want_links)
+                    if links:
                         job.say("深入作品详情：发现 %d 个作品链接" % len(links))
-                        await page.close()
                         for li, link in enumerate(links):
-                            if job.stop.is_set() or len(job.items) >= job.p["max_images"]:
+                            if job.stop.is_set() or len(job.items) >= job.p["max_images"] or (vid_mode and job.stats["videos"] >= job.p["video_limit"]):
                                 break
                             await asyncio.sleep(job.p["delay"])  # 礼貌间隔，降低对目标站的压力
                             try:
-                                p2 = await _open(job, ctx, link, bg)
-                                job.stats["pages"] += 1
-                                await _scroll_capture(job, p2, ctx, min(2, job.p["scrolls"]), shots, grab)
-                                await p2.close()
+                                if vid_mode and await video_direct(job, link) > 0:
+                                    continue
+                                await _page_pass(job, ctx, link, bg, min(2, job.p["scrolls"]), shots, grab, vid_mode, False)
                             except Exception as e:  # noqa: BLE001
                                 job.say("作品页失败 %d/%d：%s" % (li + 1, len(links), str(e)[:80]))
                     if bg:
@@ -2031,22 +2502,46 @@ def _http_get(url: str, referer: str, cookie: str, limit: int = 20 * 1024 * 1024
 
 async def crawl_http(job: Job, urls: List[str]) -> None:
     job.engine = "http"
-    job.say("未检测到 Playwright/Chromium：使用 HTTP 降级模式（只能抓静态页面里的图片；动态页面请先运行 Cell 1 安装 Chromium）")
-    if job.p["mode"] == "screenshot":
+    mode = job.p["mode"]
+    vid_mode = mode in ("video", "all")
+    grab = mode in ("images", "both", "all")
+    job.say("未检测到 Playwright/Chromium：使用 HTTP 降级模式（视频直链/公开解析可用；动态页面请先运行 Cell 1 安装 Chromium）")
+    if mode == "screenshot":
         raise RuntimeError("截图模式需要 Playwright + Chromium（运行 Kaggle Cell 1 会自动安装）")
-    cookie = job.p["cookie"]
     for ui, url in enumerate(urls):
         if job.stop.is_set():
             break
         job.say("(%d/%d) HTTP 抓取 %s" % (ui + 1, len(urls), url[:100]))
+        cookie = job.cookie_header(url)
         try:
             await check_url(url)
+            if vid_mode and is_content_url(url) and await video_direct(job, url) > 0:
+                continue
             body, ct, final = await asyncio.to_thread(_http_get, url, url, cookie)
             job.stats["pages"] += 1
             if ct.startswith("image/"):
-                await ingest(job, body, "image", final, final)
+                if grab:
+                    await ingest(job, body, "image", final, final)
+                continue
+            if ct.startswith("video/") and vid_mode and videoframes:
+                await ingest_video(job, {"url": final, "headers": {"User-Agent": UA_DESKTOP, "Referer": url}, "via": "视频直链"}, final)
                 continue
             html = body.decode("utf-8", "ignore")
+            if vid_mode and videoframes:
+                vurls = videoframes.mine_html_videos(html, final)
+                job.say("页面中发现 %d 个视频地址" % len(vurls))
+                got = 0
+                for vu in vurls:
+                    if job.stats["videos"] >= job.p["video_limit"] or job.stop.is_set():
+                        break
+                    got += await ingest_video(job, {"url": vu, "headers": {"User-Agent": UA_DESKTOP, "Referer": final}, "via": "页面源码"}, final)
+                if got == 0 and job.p["use_ytdlp"] and videoframes.has_ytdlp() and url not in job.ytdlp_tried:
+                    job.ytdlp_tried.add(url)
+                    info = await asyncio.wait_for(asyncio.to_thread(videoframes.ytdlp_resolve, url, job.cookies, False), timeout=90)
+                    if info:
+                        await ingest_video(job, info, final)
+            if not grab:
+                continue
             cands: List[str] = []
             for m in ATTR_RE.findall(html) + IMG_URL_RE.findall(html):
                 u = m.replace("\\u002F", "/").replace("\\/", "/").replace("&amp;", "&")
@@ -2054,7 +2549,8 @@ async def crawl_http(job: Job, urls: List[str]) -> None:
                     u = urllib.parse.urljoin(final, u)
                 except Exception:  # noqa: BLE001
                     continue
-                if u.startswith("http") and re.search(r"\.(jpe?g|png|webp|gif|bmp|avif)(\?|$)|image|img|photo|pic", u, re.I) and u not in cands:
+                if u.startswith("http") and re.search(r"\.(jpe?g|png|webp|gif|bmp|avif)(\?|$)|image|img|photo|pic", u, re.I) and u not in cands \
+                        and not UI_URL_RE.search(u):
                     cands.append(u)
             job.say("页面中发现 %d 个候选图片地址" % len(cands))
             sem = asyncio.Semaphore(6)
@@ -2099,10 +2595,14 @@ def normalize_params(body: Dict[str, Any]) -> Dict[str, Any]:
     kw = str(body.get("keyword") or "").strip()
     if kw and PLATFORMS[platform]["search"]:
         urls.append(PLATFORMS[platform]["search"].format(kw=urllib.parse.quote(kw)))
-    mode = str(body.get("mode") or "both")
+    mode = str(body.get("mode") or "video")
     return {
         "urls": urls[:30], "platform": platform, "keyword": kw,
-        "mode": mode if mode in ("images", "screenshot", "both") else "both",
+        # video=只要视频画面（默认）| all=视频+图片+截图 | both=图片+截图（v2.1 旧行为）| images | screenshot
+        "mode": mode if mode in ("video", "all", "images", "screenshot", "both") else "video",
+        "frames_per_video": int(num("frames_per_video", 6, 1, 24)),
+        "video_limit": int(num("video_limit", 10, 1, 60)),
+        "use_ytdlp": bool(body.get("use_ytdlp", True)),
         "max_images": int(num("max_images", 60, 1, HARD_MAX_IMAGES)),
         "scrolls": int(num("scrolls", 8, 0, 60)),
         "min_size": int(num("min_size", 200, 32, 2000)),
@@ -2139,9 +2639,13 @@ async def _run(job: Job) -> None:
         while job.tasks:  # 等待流水线里剩余的审核完成
             await asyncio.gather(*list(job.tasks), return_exceptions=True)
         job.state = "stopped" if job.stop.is_set() else "done"
-        job.say("任务%s：抓到 %d 张图片 + %d 张截图，已审核 %d 张（拦截 %d / 待复核 %d / 通过 %d）" % (
-            "已停止" if job.stop.is_set() else "完成", job.stats["found"], job.stats["screenshots"],
-            job.stats["analyzed"], job.stats["block"], job.stats["review"], job.stats["pass"]))
+        st = job.stats
+        job.say("任务%s：视频 %d 个 → 抽帧 %d 张 · 图片 %d 张 · 截图 %d 张，已审核 %d 张（拦截 %d / 待复核 %d / 通过 %d），登录墙排除 %d 张" % (
+            "已停止" if job.stop.is_set() else "完成", st["videos"], st["frames"], st["found"], st["screenshots"],
+            st["analyzed"], st["block"], st["review"], st["pass"], st["walls"]))
+        if job.p["mode"] in ("video", "all") and st["frames"] == 0 and not job.stop.is_set():
+            job.say("⚠️ 没有拿到任何视频画面。常见原因：① 该平台的搜索页/推荐页必须登录才出内容；② 视频流需要登录态。"
+                    "办法：直接粘贴【具体的视频链接】（抖音/B站会走公开解析，不用登录），或在高级选项里填入你自己账号的 Cookie。")
     except Exception as e:  # noqa: BLE001
         log.exception("爬取任务失败")
         job.state = "error"
@@ -2171,6 +2675,7 @@ def view(job: Job, since: int = 0) -> Dict[str, Any]:
         "id": job.id, "state": job.state, "error": job.error, "engine": job.engine, "rev": job.rev,
         "elapsed": round((job.finished or time.time()) - job.created, 1), "stats": job.stats,
         "pending": job.pending, "conc": job.conc, "gpu_count": job.gpu_count, "cap_hit": job.cap_hit,
+        "video_cap_hit": job.video_cap_hit,
         "logs": job.logs[-60:], "total": len(job.items),
         "params": {k: v for k, v in job.p.items() if k != "cookie"},
         "items": [i for i in job.items if i.get("rev", 0) > since],
@@ -2184,6 +2689,870 @@ def image_path(job: Job, idx: int, thumb: bool) -> Optional[Path]:
 
 def export_json(job: Job) -> str:
     return json.dumps({"job": view(job, 0)}, ensure_ascii=False, indent=2)
+
+
+def export_xlsx(job: Job, include_wall: bool = False) -> bytes:
+    """把本次爬取结果导出为 Excel（含缩略图 + 违规类别 + 汇总）。登录墙截图默认不导出"""
+    import report  # 延迟导入：缺 openpyxl 时只影响导出
+
+    rows: List[Dict[str, Any]] = []
+    for it in job.items:
+        res = it.get("res")
+        if not res or (it.get("wall") and not include_wall):
+            continue
+        tp = job.dir / ("%d_t.jpg" % it["idx"])
+        rows.append({
+            "idx": it["idx"], "kind": it.get("kind"), "name": it.get("name"), "res": res, "page": it.get("page"),
+            "src": it.get("src"), "video": it.get("video"), "ts": it.get("ts"), "title": it.get("title"),
+            "image": tp.read_bytes() if tp.exists() else None,
+        })
+    meta = {"title": "网络照片自动爬取审核报告", "platform": PLATFORMS.get(job.p["platform"], {}).get("name", ""),
+            "urls": job.p["urls"], "keyword": job.p["keyword"], "mode": job.p["mode"], "elapsed": round((job.finished or time.time()) - job.created, 1),
+            "stats": job.stats, "gpu_count": job.gpu_count, "walls": job.stats.get("walls", 0)}
+    return report.build_xlsx(rows, meta)
+''',
+"videoframes.py": r'''"""
+视频 → 审核用截图（帧）模块 v2.2（与 crawler.py 配合；不依赖 GPU 模块，缺依赖时只会降级）
+
+为什么需要它（第一性原则）：
+  旧版爬取只做「抓 <img> + 页面截图」。抖音/小红书/微博等平台的搜索页、推荐页没有登录就会被登录弹窗遮住，
+  于是抓到的全是「二维码 / 登录框 / 头像 / 图标」截图。而你真正要审核的是【视频里的画面】。
+  视频画面不在 <img> 里，它在视频流里 —— 所以正确做法是：找到视频流地址 → 下载/拉流 → 用 ffmpeg 抽帧 → 送 GPU 审核。
+
+视频流地址的 4 个来源（从最稳到最广，任何一个失败都只会降级）：
+  1) 平台公开解析器：抖音分享页(iesdouyin.com/share/video/<id>，公开页，不用登录)、B 站公开接口(playurl 的 mp4 低清晰度流)
+  2) yt-dlp：覆盖 B 站/微博/YouTube/几百个站点（可选；装不上就跳过）
+  3) 浏览器网络抓包：页面加载时出现的 video/*、m3u8、mp4 请求；JSON/HTML 响应里挖出来的 .mp4/.m3u8 地址
+  4) DOM：<video src> / <source src> / og:video
+抽帧：ffmpeg 快速定位（-ss 在 -i 前）均匀取 N 帧；没有 ffmpeg 时回退 OpenCV；丢弃纯黑/纯色帧，并按感知哈希去重。
+
+合规边界（与 crawler.py 一致）：不破解验证码、不绕过登录、不做指纹伪装；只处理公开可访问的视频流，
+或使用者提供的【自己账号】Cookie 能访问的视频流；不保存视频文件（抽完帧立即删除）。
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from PIL import Image, ImageStat
+
+UA_DESKTOP = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36")
+UA_MOBILE = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+             "Version/16.6 Mobile/15E148 Safari/604.1")
+MAX_DOWNLOAD = int(os.getenv("VIDEO_MAX_MB", "150")) * 1024 * 1024  # 单个视频最多下载多少（超出则只用已下载的前半部分）
+
+
+# --------------------------------------------------------------------------
+# 能力探测
+# --------------------------------------------------------------------------
+def ffmpeg_path() -> Optional[str]:
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:  # pip install imageio-ffmpeg 自带静态 ffmpeg（Kaggle 一般已有系统 ffmpeg，这里只是兜底）
+        import imageio_ffmpeg  # type: ignore
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _has_mod(name: str) -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(name) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def has_ytdlp() -> bool:
+    return _has_mod("yt_dlp")
+
+
+def has_cv2() -> bool:
+    return _has_mod("cv2")
+
+
+def capabilities() -> Dict[str, Any]:
+    return {"ffmpeg": bool(ffmpeg_path()), "ytdlp": has_ytdlp(), "cv2": has_cv2()}
+
+
+# --------------------------------------------------------------------------
+# 从任意文本（HTML / JSON / JS）里挖视频地址
+# --------------------------------------------------------------------------
+VIDEO_URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+?\.(?:mp4|m3u8|webm|mov|m4v|flv)(?:\?[^\s\"'<>\\)]*)?", re.I)
+# 没有扩展名但一定是视频流的 CDN / 接口
+VIDEO_HOST_RE = re.compile(
+    r"https?://[^\s\"'<>\\)]*(?:douyinvod\.com|aweme/v1/play|aweme/v1/playwm|bilivideo\.(?:com|cn)|/upgcxcode/|"
+    r"xhscdn\.com/stream|video\.weibocdn\.com|ixigua\.com/video|zjcdn\.com|"
+    r"mime_type=video)[^\s\"'<>\\)]*", re.I)
+NOT_VIDEO_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|css|js|json|ts|m4s)(?:\?|$)|mime_type=audio|media-audio|\.mp3(?:\?|$)|/ads?/|doubleclick", re.I)
+
+
+def _unescape(text: str) -> str:
+    return (text.replace("\\u002F", "/").replace("\\u002f", "/").replace("\\/", "/")
+            .replace("\\u0026", "&").replace("&amp;", "&"))
+
+
+def mine_video_urls(text: str, base: str = "") -> List[str]:
+    """从文本里挖出所有疑似视频流地址（已去转义、去重、保持出现顺序）"""
+    if not text:
+        return []
+    t = _unescape(text)
+    out: List[str] = []
+    for rx in (VIDEO_URL_RE, VIDEO_HOST_RE):
+        for m in rx.findall(t):
+            u = m.rstrip(".,;")
+            if u.startswith("//"):
+                u = "https:" + u
+            if base:
+                u = urllib.parse.urljoin(base, u)
+            if NOT_VIDEO_RE.search(u):
+                continue
+            if u not in out:
+                out.append(u)
+    return out
+
+
+_TAG_VIDEO = re.compile(r"<(?:video|source)\b[^>]*>", re.I)
+_ATTR_SRC = re.compile(r"""\b(?:src|data-src|data-video|data-url)\s*=\s*["']([^"']+)["']""", re.I)
+_META_VIDEO = re.compile(r"""<meta[^>]+(?:property|name)=["'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["'][^>]*content=["']([^"']+)["']""", re.I)
+
+
+def mine_html_videos(html: str, base: str) -> List[str]:
+    """HTML 里的 <video src> / <source src>（含相对路径）/ og:video，转成绝对地址；再加上正则从文本里挖到的绝对地址"""
+    out: List[str] = []
+
+    def add(u: str) -> None:
+        u = _unescape(u.strip())
+        if not u or u.startswith(("blob:", "data:", "javascript:")):
+            return
+        try:
+            u = urllib.parse.urljoin(base, u)
+        except Exception:  # noqa: BLE001
+            return
+        if u.startswith("http") and u not in out and not re.search(r"\.(?:jpe?g|png|gif|webp|svg)(?:\?|$)", u, re.I):
+            out.append(u)
+
+    for tag in _TAG_VIDEO.findall(html or ""):
+        for m in _ATTR_SRC.findall(tag):
+            add(m)
+    for m in _META_VIDEO.findall(html or ""):
+        add(m)
+    for u in mine_video_urls(html, base):
+        add(u)
+    return out
+
+
+def norm_key(u: str) -> str:
+    """同一个视频的不同分片/不同签名参数归一成同一个 key，避免重复抽帧"""
+    try:
+        p = urllib.parse.urlparse(u)
+        q = urllib.parse.parse_qs(p.query)
+        keep = [(k, q[k][0]) for k in ("video_id", "vid", "file_id", "fid") if k in q]
+        return p.path + ("?" + urllib.parse.urlencode(keep) if keep else "")
+    except Exception:  # noqa: BLE001
+        return u
+
+
+def is_media_response(ct: str, url: str) -> bool:
+    """网络响应是不是视频流（只看响应头，不读 body）"""
+    ct = (ct or "").lower()
+    if ct.startswith("audio/") or NOT_VIDEO_RE.search(url) and not ct.startswith("video/"):
+        return False
+    if ct.startswith("video/") or "mpegurl" in ct:
+        return True
+    if ct in ("application/octet-stream", "binary/octet-stream", "") and VIDEO_HOST_RE.search(url):
+        return True
+    return bool(re.search(r"\.(?:mp4|m3u8|webm|mov|m4v)(?:\?|$)", url, re.I)) and not ct.startswith("image/") and "json" not in ct
+
+
+# --------------------------------------------------------------------------
+# Cookie：支持 3 种常见格式（浏览器请求头 / Cookie-Editor JSON / Netscape cookies.txt）
+# --------------------------------------------------------------------------
+def parse_cookie_text(raw: str, default_domain: str = "") -> List[Dict[str, Any]]:
+    raw = (raw or "").strip()
+    out: List[Dict[str, Any]] = []
+    if not raw:
+        return out
+    if raw[0] in "[{":  # EditThisCookie / Cookie-Editor 导出的 JSON
+        try:
+            data = json.loads(raw)
+            arr = data if isinstance(data, list) else data.get("cookies", [])
+            for c in arr:
+                if isinstance(c, dict) and c.get("name"):
+                    out.append({"name": str(c["name"]), "value": str(c.get("value", "")),
+                                "domain": str(c.get("domain") or default_domain), "path": str(c.get("path") or "/")})
+            return out
+        except Exception:  # noqa: BLE001
+            pass
+    if "\t" in raw and "\n" in raw:  # Netscape cookies.txt：domain flag path secure expiry name value
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+                continue
+            line = line.replace("#HttpOnly_", "")
+            f = line.split("\t")
+            if len(f) >= 7:
+                out.append({"name": f[5], "value": f[6], "domain": f[0], "path": f[2] or "/"})
+        if out:
+            return out
+    for part in raw.split(";"):  # 最常见：a=1; b=2
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k:
+            out.append({"name": k, "value": v, "domain": default_domain, "path": "/"})
+    return out
+
+
+def cookie_header_for(cookies: List[Dict[str, Any]], url: str) -> str:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    parts = []
+    for c in cookies:
+        d = str(c.get("domain") or "").lstrip(".").lower()
+        if not d or host == d or host.endswith("." + d):
+            parts.append("%s=%s" % (c["name"], c["value"]))
+    return "; ".join(parts)
+
+
+def write_netscape(cookies: List[Dict[str, Any]], path: str) -> None:
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        d = str(c.get("domain") or "")
+        if not d:
+            continue
+        lines.append("\t".join([d, "TRUE" if d.startswith(".") else "FALSE", c.get("path") or "/", "FALSE", "2147483647",
+                                c["name"], c["value"]]))
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# 小工具
+# --------------------------------------------------------------------------
+def _http(url: str, headers: Dict[str, str], timeout: int = 20, limit: int = 4 * 1024 * 1024) -> Tuple[bytes, str]:
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(limit), r.geturl()
+
+
+def _json_after(text: str, marker: str) -> Optional[Any]:
+    """在 text 中找到 marker 之后的第一个 JSON 对象并完整解析（比 .*? 正则可靠）"""
+    i = text.find(marker)
+    if i < 0:
+        return None
+    j = text.find("{", i + len(marker))
+    if j < 0:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[j:])
+        return obj
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _dhash(img: Image.Image) -> int:
+    g = img.convert("L").resize((9, 8), Image.BILINEAR)
+    px = list(g.getdata())
+    bits = 0
+    for r in range(8):
+        for c in range(8):
+            bits = (bits << 1) | (1 if px[r * 9 + c] > px[r * 9 + c + 1] else 0)
+    return bits
+
+
+def _bad_frame(img: Image.Image) -> bool:
+    """纯黑 / 纯色（还没解码出画面、转场黑屏）的帧没有审核价值"""
+    g = img.convert("L").resize((64, 64))
+    st = ImageStat.Stat(g)
+    return st.stddev[0] < 5.0 or st.mean[0] < 6.0
+
+
+# --------------------------------------------------------------------------
+# 平台公开解析器：返回 {"url","headers","cover","title","images":[...],"via"} 或 None（同步函数，放线程里跑）
+# --------------------------------------------------------------------------
+_DY_ID = re.compile(r"/(?:video|note|slides)/(\d{8,})|modal_id=(\d{8,})")
+
+
+def douyin_resolve(url: str) -> Optional[Dict[str, Any]]:
+    """抖音：短链/长链 → 作品 id → 公开分享页 iesdouyin.com/share/video/<id>（手机 UA）→ 页面内 _ROUTER_DATA"""
+    try:
+        h = {"User-Agent": UA_MOBILE, "Accept-Language": "zh-CN,zh;q=0.9"}
+        m = _DY_ID.search(url)
+        if not m:
+            _, final = _http(url, h, timeout=15, limit=2000)
+            m = _DY_ID.search(final)
+        if not m:
+            return None
+        vid = m.group(1) or m.group(2)
+        html, _ = _http("https://www.iesdouyin.com/share/video/%s/" % vid, h, timeout=20, limit=3 * 1024 * 1024)
+        data = _json_after(html.decode("utf-8", "ignore"), "window._ROUTER_DATA")
+        if not data:
+            return None
+        info = None
+        for v in (data.get("loaderData") or {}).values():
+            if isinstance(v, dict) and isinstance(v.get("videoInfoRes"), dict):
+                lst = v["videoInfoRes"].get("item_list") or []
+                if lst:
+                    info = lst[0]
+                    break
+        if not info:
+            return None
+        video = info.get("video") or {}
+        urls = (video.get("play_addr") or {}).get("url_list") or []
+        cover = ((video.get("cover") or {}).get("url_list") or [""])[0]
+        images = []
+        for im in info.get("images") or []:
+            ul = (im or {}).get("url_list") or []
+            if ul:
+                images.append(ul[0])
+        play = urls[0].replace("playwm", "play") if urls else ""
+        if play and images and ("mp3" in play or not video.get("duration")):
+            play = ""  # 图集的配乐，不是视频
+        if not play and not images:
+            return None
+        return {"url": play, "headers": {"User-Agent": UA_MOBILE, "Referer": "https://www.douyin.com/"},
+                "cover": cover, "title": info.get("desc") or "", "images": images, "via": "抖音公开分享页"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def bilibili_resolve(url: str) -> Optional[Dict[str, Any]]:
+    """B 站：BV 号 → view 接口（cid/封面）→ playurl（html5 平台、mp4 单文件流，未登录可得低清晰度）"""
+    try:
+        h = {"User-Agent": UA_DESKTOP, "Referer": "https://www.bilibili.com/"}
+        if "b23.tv" in url:
+            _, url = _http(url, h, timeout=15, limit=2000)
+        m = re.search(r"(BV[0-9A-Za-z]{10})", url)
+        if not m:
+            return None
+        bvid = m.group(1)
+        pm = re.search(r"[?&]p=(\d+)", url)
+        page = int(pm.group(1)) if pm else 1
+        raw, _ = _http("https://api.bilibili.com/x/web-interface/view?bvid=%s" % bvid, h)
+        d = json.loads(raw.decode("utf-8", "ignore")).get("data") or {}
+        pages = d.get("pages") or []
+        cid = (pages[page - 1] if 0 < page <= len(pages) else {}).get("cid") or d.get("cid")
+        if not cid:
+            return None
+        raw, _ = _http("https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%s&qn=32&fnval=1&fnver=0&platform=html5&high_quality=0"
+                       % (bvid, cid), h)
+        pu = json.loads(raw.decode("utf-8", "ignore")).get("data") or {}
+        durl = pu.get("durl") or []
+        if not durl:
+            return None
+        return {"url": durl[0]["url"], "headers": h, "cover": d.get("pic") or "", "title": d.get("title") or "",
+                "images": [], "via": "B站公开接口"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def ytdlp_resolve(url: str, cookies: Optional[List[Dict[str, Any]]] = None, mobile: bool = False) -> Optional[Dict[str, Any]]:
+    """yt-dlp 只解析不下载：返回最合适的（≤720p）视频流地址 + 需要的请求头"""
+    try:
+        import yt_dlp  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    tmp = None
+    try:
+        opts: Dict[str, Any] = {
+            "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True, "socket_timeout": 20,
+            "format": "bv*[height<=720]/b[height<=720]/bv*/b",
+            "http_headers": {"User-Agent": UA_MOBILE if mobile else UA_DESKTOP}, "playlist_items": "1",
+        }
+        if cookies:
+            fd, tmp = tempfile.mkstemp(suffix=".txt")
+            os.close(fd)
+            host = urllib.parse.urlparse(url).hostname or ""
+            dom = "." + ".".join(host.split(".")[-2:]) if "." in host else host
+            write_netscape([dict(c, domain=c.get("domain") or dom) for c in cookies], tmp)
+            opts["cookiefile"] = tmp
+        with yt_dlp.YoutubeDL(opts) as y:
+            info = y.extract_info(url, download=False)
+        if not info:
+            return None
+        if info.get("entries"):
+            info = next((e for e in info["entries"] if e), None) or info
+        fmt = (info.get("requested_formats") or [info])[0]
+        u = fmt.get("url") or info.get("url")
+        if not u:
+            return None
+        hh = dict(fmt.get("http_headers") or info.get("http_headers") or {})
+        return {"url": u, "headers": hh, "cover": info.get("thumbnail") or "", "title": info.get("title") or "",
+                "images": [], "via": "yt-dlp(%s)" % (info.get("extractor_key") or "?")}
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# 抽帧
+# --------------------------------------------------------------------------
+def _hdr_args(headers: Dict[str, str]) -> List[str]:
+    if not headers:
+        return []
+    ua = headers.get("User-Agent") or headers.get("user-agent")
+    rest = "".join("%s: %s\r\n" % (k, v) for k, v in headers.items() if k.lower() != "user-agent")
+    args: List[str] = []
+    if ua:
+        args += ["-user_agent", ua]
+    if rest:
+        args += ["-headers", rest]
+    return args
+
+
+def _probe_duration(ff: str, src: str, hdr: List[str]) -> float:
+    try:
+        p = subprocess.run([ff, "-hide_banner", *hdr, "-i", src], capture_output=True, text=True, timeout=45)
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", p.stderr or "")
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
+def _download(url: str, headers: Dict[str, str], dest: str, limit: int = MAX_DOWNLOAD) -> int:
+    req = urllib.request.Request(url, headers=headers)
+    n = 0
+    with urllib.request.urlopen(req, timeout=25) as r, open(dest, "wb") as f:
+        while n < limit:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            n += len(chunk)
+    return n
+
+
+def _jpeg(img: Image.Image, maxside: int = 1280) -> bytes:
+    img = img.convert("RGB")
+    img.thumbnail((maxside, maxside))
+    b = io.BytesIO()
+    img.save(b, "JPEG", quality=90)
+    return b.getvalue()
+
+
+def _frames_ffmpeg(ff: str, src: str, hdr: List[str], times: List[float], workdir: str) -> List[Tuple[float, Image.Image]]:
+    out: List[Tuple[float, Image.Image]] = []
+    for i, t in enumerate(times):
+        dst = os.path.join(workdir, "f%02d.jpg" % i)
+        try:
+            subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", *hdr, "-ss", "%.2f" % t, "-i", src, "-frames:v", "1",
+                            "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", dst],
+                           capture_output=True, timeout=60)
+            if os.path.exists(dst) and os.path.getsize(dst) > 1000:
+                img = Image.open(dst)
+                img.load()
+                out.append((t, img))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _frames_cv2(path: str, times: List[float]) -> List[Tuple[float, Image.Image]]:
+    out: List[Tuple[float, Image.Image]] = []
+    try:
+        import cv2  # type: ignore
+    except Exception:  # noqa: BLE001
+        return out
+    cap = cv2.VideoCapture(path)
+    try:
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+            ok, fr = cap.read()
+            if ok and fr is not None:
+                out.append((t, Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))))
+    finally:
+        cap.release()
+    return out
+
+
+def extract_frames(src_url: str, headers: Dict[str, str], n: int = 6) -> Tuple[List[Tuple[float, bytes]], str]:
+    """
+    视频地址（http(s) 或本地路径）→ [(时间点秒, JPEG 字节)]，以及一句说明（时长 / 失败原因）。同步函数，放线程里跑。
+    mp4：先下载（≤150MB）再本地抽帧（快且稳）；m3u8：直接让 ffmpeg 拉流抽帧。
+    """
+    n = max(1, min(24, int(n)))
+    ff = ffmpeg_path()
+    work = tempfile.mkdtemp(prefix="vf_")
+    try:
+        is_http = src_url.lower().startswith(("http://", "https://"))
+        is_hls = is_http and "m3u8" in src_url.lower()
+        local: Optional[str] = None
+        note = ""
+        if not is_http:
+            local = src_url
+        elif not is_hls:
+            local = os.path.join(work, "v.bin")
+            try:
+                size = _download(src_url, headers, local)
+                if size < 3000:
+                    local = None
+                    note = "视频下载内容过小（可能被防盗链拦截）"
+            except Exception as e:  # noqa: BLE001
+                local = None
+                note = "下载失败：%s" % str(e)[:80]
+        src = local or src_url
+        if not ff and not (local and has_cv2()):
+            return [], note or "没有 ffmpeg / OpenCV，无法抽帧（运行 Cell 1 会自动安装）"
+        hdr = [] if local else _hdr_args(headers)
+        dur = _probe_duration(ff, src, hdr) if ff else 0.0
+        if dur <= 0 and local and has_cv2():
+            try:
+                import cv2  # type: ignore
+
+                cap = cv2.VideoCapture(local)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0
+                cnt = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                cap.release()
+                dur = cnt / fps if fps > 0 and cnt > 0 else 0.0
+            except Exception:  # noqa: BLE001
+                dur = 0.0
+        if dur <= 0:
+            times = [0.5, 2.0, 4.0, 8.0, 15.0, 30.0][:n]
+        else:
+            k = n if dur >= 3 else min(n, 2)
+            times = [max(0.2, min(dur - 0.3, dur * (i + 0.5) / k)) for i in range(k)]
+        raw: List[Tuple[float, Image.Image]] = []
+        if ff:
+            raw = _frames_ffmpeg(ff, src, hdr, times, work)
+        if not raw and local and has_cv2():
+            raw = _frames_cv2(local, times)
+        if not raw:
+            return [], note or "ffmpeg 无法解码该视频（可能是加密/DRM 流）"
+        kept: List[Tuple[float, bytes]] = []
+        hashes: List[int] = []
+        for t, img in raw:
+            if _bad_frame(img):
+                continue
+            h = _dhash(img)
+            if any(bin(h ^ o).count("1") <= 2 for o in hashes):
+                continue
+            hashes.append(h)
+            kept.append((round(t, 1), _jpeg(img)))
+        return kept, ("时长 %.0fs" % dur if dur else "时长未知") + ("" if kept else "，但所有帧都是黑屏/纯色")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def fetch_bytes(url: str, headers: Dict[str, str], limit: int = 8 * 1024 * 1024) -> Optional[bytes]:
+    """下载封面/图集图片（同步）"""
+    try:
+        data, _ = _http(url, headers, timeout=20, limit=limit)
+        return data
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def selftest() -> str:
+    """Cell 1 自检：用 ffmpeg 现场生成一个 2 秒测试视频，再抽帧，证明「视频→截图」链路可用"""
+    ff = ffmpeg_path()
+    if not ff:
+        return "❌ 没有 ffmpeg"
+    d = tempfile.mkdtemp(prefix="vf_t_")
+    try:
+        p = os.path.join(d, "t.mp4")
+        r = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                            "testsrc=size=320x240:rate=10:duration=2", "-pix_fmt", "yuv420p", p], capture_output=True, timeout=60)
+        if not os.path.exists(p):
+            return "❌ ffmpeg 不能编码测试视频：" + (r.stderr or b"").decode("utf-8", "ignore")[-120:]
+        frames, note = extract_frames(p, {}, 2)
+        return "✅ ffmpeg 抽帧自检通过（%d 帧）" % len(frames) if frames else "❌ 抽帧自检失败：" + note
+    except Exception as e:  # noqa: BLE001
+        return "❌ 抽帧自检异常：%s" % str(e)[:100]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    print(capabilities(), time.strftime("%H:%M:%S"))
+    print(selftest())
+''',
+"report.py": r'''"""
+Excel 报告生成（v2.2）：把审核结果导出成 .xlsx —— 每行一张图（缩略图直接嵌在单元格里）+ 结论 + 违规类别（涉政/涉黄/暴力…）+ 原因。
+
+用在两处（爬取页 / 图片审核页各有一个「生成 Excel」按钮）：
+  GET  /api/crawl/{job_id}/xlsx   爬取任务的结果（缩略图读服务端落盘文件）
+  POST /api/export/xlsx           图片审核页 / 任意前端：把 {rows:[{name,image(dataURL),res}]} 交给服务端生成
+前端（React 网站）另有一份纯浏览器版（src/lib/excel.ts，用 exceljs），连不上 Kaggle 时也能导出；两边的「违规类别」规则保持一致。
+
+只依赖 openpyxl + Pillow（Kaggle 自带 openpyxl；没有时 Cell 1 会安装）。
+"""
+from __future__ import annotations
+
+import base64
+import io
+import re
+import time
+from collections import Counter
+from typing import Any, Dict, List, Optional
+
+from PIL import Image
+
+KIND_LABEL = {"frame": "视频截图(帧)", "cover": "视频封面", "image": "网络图片", "screenshot": "页面截图", "upload": "上传图片"}
+VERDICT_LABEL = {"pass": "通过", "review": "待复核", "block": "拦截", "error": "审核失败"}
+VERDICT_FILL = {"block": "FFC7CE", "review": "FFEB9C", "pass": "C6EFCE", "error": "D9D9D9"}
+RISK_RANK = {"block": 0, "review": 1, "pass": 2, "error": 3}
+ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+IMG_W = 150  # 单元格里缩略图的显示宽度（像素）
+
+
+def categories_of(res: Optional[Dict[str, Any]]) -> List[str]:
+    """违规类别（与前端 src/lib/excel.ts 的 categoriesOf 规则一致）"""
+    if not res:
+        return []
+    out: List[str] = []
+    porn = (res.get("porn") or {}).get("level")
+    pol = (res.get("political") or {}).get("level")
+    vio = (res.get("violence") or {}).get("level")
+    if porn == "explicit":
+        out.append("涉黄")
+    elif porn == "suggestive":
+        out.append("涉黄(疑似/低俗)")
+    if pol == "high":
+        out.append("涉政")
+    elif pol == "low":
+        out.append("涉政(疑似/需复核)")
+    if vio == "high":
+        out.append("暴力血腥")
+    elif vio == "low":
+        out.append("暴力(提示)")
+    if res.get("minors_suspected") and porn in ("explicit", "suggestive"):
+        out.append("疑似涉未成年人")
+    aux = res.get("aux") or {}
+    if aux.get("qr") or aux.get("contacts"):
+        out.append("二维码/联系方式引流")
+    return out
+
+
+def category_text(res: Optional[Dict[str, Any]], verdict: str) -> str:
+    c = categories_of(res)
+    if c:
+        return "、".join(c)
+    return "未发现违规" if verdict == "pass" else ("需人工复核" if verdict == "review" else "")
+
+
+def _clean(v: Any, limit: int = 3000) -> str:
+    s = "" if v is None else str(v)
+    return ILLEGAL.sub("", s)[:limit]
+
+
+def _thumb(raw: Optional[bytes]) -> Optional[tuple]:
+    """原图字节 → (JPEG 字节, 显示宽, 显示高)。统一缩到宽 ≤300px，xlsx 体积小、打开快"""
+    if not raw:
+        return None
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.load()
+        im = im.convert("RGB")
+        im.thumbnail((300, 300))
+        b = io.BytesIO()
+        im.save(b, "JPEG", quality=80)
+        w, h = im.size
+        k = IMG_W / max(1, w)
+        dw, dh = IMG_W, max(40, min(160, int(h * k)))
+        if h * k > 160:  # 太高的竖图按高度限制
+            dh = 160
+            dw = max(40, int(w * 160 / max(1, h)))
+        return b.getvalue(), dw, dh
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def rows_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """POST /api/export/xlsx 的请求体 → 统一行格式。image 为 dataURL（data:image/jpeg;base64,...）"""
+    rows: List[Dict[str, Any]] = []
+    for i, r in enumerate(payload.get("rows") or []):
+        img = None
+        data = r.get("image")
+        if isinstance(data, str) and "," in data:
+            try:
+                img = base64.b64decode(data.split(",", 1)[1])
+            except Exception:  # noqa: BLE001
+                img = None
+        rows.append({"idx": r.get("idx", i + 1), "kind": r.get("kind") or "upload", "name": r.get("name"), "res": r.get("res"),
+                     "page": r.get("page"), "src": r.get("src"), "video": r.get("video"), "ts": r.get("ts"), "title": r.get("title"),
+                     "err": r.get("err"), "image": img})
+    return rows
+
+
+def build_xlsx(rows: List[Dict[str, Any]], meta: Optional[Dict[str, Any]] = None) -> bytes:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as XlImage
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("缺少 openpyxl，请先运行 Cell 1（pip install openpyxl）：%s" % e)
+
+    meta = meta or {}
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "审核明细"
+    sm = wb.create_sheet("汇总", 0)
+
+    def verdict_of(r: Dict[str, Any]) -> str:
+        res = r.get("res")
+        return str(res.get("verdict")) if res and res.get("verdict") in VERDICT_LABEL else "error"
+
+    rows = sorted(rows, key=lambda r: (RISK_RANK.get(verdict_of(r), 3), -max(((r.get("res") or {}).get("porn") or {}).get("score", 0),
+                                                                              ((r.get("res") or {}).get("political") or {}).get("score", 0)),
+                                       r.get("idx") or 0))
+
+    heads = ["序号", "截图/照片", "来源类型", "名称", "视频时间点(秒)", "审核结论", "违规类别", "涉黄分", "涉政分", "暴力分",
+             "判定原因", "AI 中文描述", "图中文字(OCR)", "命中关键词", "来源页面", "视频/图片地址", "处理 GPU"]
+    widths = [6, 24, 13, 26, 10, 10, 24, 8, 8, 8, 42, 42, 32, 20, 34, 34, 18]
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="1F3864")
+    for c, (h, w) in enumerate(zip(heads, widths), start=1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = head_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.row_dimensions[1].height = 26
+    ws.freeze_panes = "C2"
+
+    cnt_v: Counter = Counter()
+    cnt_c: Counter = Counter()
+    cnt_k: Counter = Counter()
+    cnt_g: Counter = Counter()
+    top = Alignment(vertical="top", wrap_text=True)
+    for i, r in enumerate(rows, start=2):
+        res = r.get("res") or {}
+        v = verdict_of(r)
+        cats = categories_of(res)
+        kw = res.get("keywords") or {}
+        kws = list(kw.get("political") or []) + list(kw.get("porn") or [])
+        gpu = str(res.get("gpu") or "")
+        cnt_v[v] += 1
+        cnt_k[KIND_LABEL.get(str(r.get("kind")), str(r.get("kind") or ""))] += 1
+        if gpu:
+            cnt_g[gpu] += 1
+        for c in (cats or (["未发现违规"] if v == "pass" else [])):
+            cnt_c[c] += 1
+        link = _clean(r.get("page"))
+        vals = [
+            r.get("idx"), None, KIND_LABEL.get(str(r.get("kind")), str(r.get("kind") or "")),
+            _clean(r.get("title") or r.get("name")), r.get("ts") if r.get("ts") is not None else "",
+            VERDICT_LABEL.get(v, v), category_text(res, v) if res else _clean(r.get("err") or "审核失败"),
+            round(float((res.get("porn") or {}).get("score", 0)), 3) if res else "",
+            round(float((res.get("political") or {}).get("score", 0)), 3) if res else "",
+            round(float((res.get("violence") or {}).get("score", 0)), 3) if res else "",
+            _clean("；".join(res.get("reasons") or [])), _clean(res.get("description")), _clean(res.get("ocr_text")),
+            _clean("、".join(kws)), link, _clean(r.get("video") or r.get("src")), gpu,
+        ]
+        fill = PatternFill("solid", fgColor=VERDICT_FILL.get(v, "FFFFFF"))
+        for c, val in enumerate(vals, start=1):
+            cell = ws.cell(row=i, column=c, value=val)
+            cell.alignment = top
+            cell.border = border
+            if c in (6, 7):
+                cell.fill = fill
+                cell.font = Font(bold=True)
+        if link.startswith("http"):
+            ws.cell(row=i, column=15).hyperlink = link
+            ws.cell(row=i, column=15).font = Font(color="0563C1", underline="single")
+        th = _thumb(r.get("image"))
+        if th:
+            data, dw, dh = th
+            img = XlImage(io.BytesIO(data))
+            img.width, img.height = dw, dh
+            ws.add_image(img, "B%d" % i)
+            ws.row_dimensions[i].height = max(60, dh * 0.75 + 8)
+        else:
+            ws.cell(row=i, column=2, value="（无图）")
+            ws.row_dimensions[i].height = 40
+    ws.auto_filter.ref = "A1:%s%d" % (get_column_letter(len(heads)), max(1, len(rows) + 1))
+
+    # ---------------- 汇总 ----------------
+    sm.column_dimensions["A"].width = 26
+    sm.column_dimensions["B"].width = 16
+    sm.column_dimensions["C"].width = 70
+    r0 = 1
+
+    def put(a: Any, b: Any = None, c: Any = None, bold: bool = False, fill: Optional[str] = None) -> None:
+        nonlocal r0
+        for col, val in enumerate((a, b, c), start=1):
+            if val is None:
+                continue
+            cell = sm.cell(row=r0, column=col, value=val if not isinstance(val, str) else _clean(val, 1500))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if bold:
+                cell.font = Font(bold=True, size=13 if col == 1 and r0 == 1 else 11)
+            if fill:
+                cell.fill = PatternFill("solid", fgColor=fill)
+        r0 += 1
+
+    put(meta.get("title") or "图片智能审查报告", bold=True)
+    put("生成时间", time.strftime("%Y-%m-%d %H:%M:%S"))
+    if meta.get("platform"):
+        put("平台", meta["platform"])
+    if meta.get("urls"):
+        put("入口网址", None, "\n".join(meta["urls"][:10]))
+    if meta.get("keyword"):
+        put("关键词", meta["keyword"])
+    if meta.get("mode"):
+        put("采集方式", {"video": "视频抽帧(视频画面)", "all": "视频+图片+截图", "both": "图片+截图", "images": "仅图片",
+                       "screenshot": "仅截图"}.get(meta["mode"], meta["mode"]))
+    if meta.get("elapsed") is not None:
+        put("用时(秒)", meta["elapsed"])
+    st = meta.get("stats") or {}
+    if st:
+        put("视频数 / 抽帧数", "%s / %s" % (st.get("videos", 0), st.get("frames", 0)))
+    if meta.get("walls"):
+        put("登录墙截图(已排除，不在明细中)", meta["walls"])
+    r0 += 1
+    put("审核结论", "数量", None, bold=True, fill="D9E1F2")
+    for k in ("block", "review", "pass", "error"):
+        if cnt_v.get(k):
+            put(VERDICT_LABEL[k], cnt_v[k], None, fill=VERDICT_FILL[k])
+    put("合计", len(rows), None, bold=True)
+    r0 += 1
+    put("违规类别", "数量", "说明", bold=True, fill="D9E1F2")
+    notes = {"涉黄": "NSFW 分类器/NudeNet/CLIP/大模型综合判定为明确色情", "涉黄(疑似/低俗)": "性暗示/低俗，建议人工复核",
+             "涉政": "疑似敏感政治内容或命中涉政关键词，已拦截", "涉政(疑似/需复核)": "含政治相关元素，建议人工复核",
+             "暴力血腥": "疑似血腥/暴力，建议人工复核", "暴力(提示)": "出现武器等暴力倾向，仅提示", "疑似涉未成年人": "疑似未成年人 + 性相关内容，升级拦截",
+             "二维码/联系方式引流": "图中有二维码或微信/QQ/手机号/网址", "未发现违规": "通过"}
+    for k, n in cnt_c.most_common():
+        put(k, n, notes.get(k, ""))
+    r0 += 1
+    put("来源类型", "数量", None, bold=True, fill="D9E1F2")
+    for k, n in cnt_k.most_common():
+        put(k, n)
+    r0 += 1
+    put("GPU（T4 双卡）", "处理张数", None, bold=True, fill="D9E1F2")
+    for k, n in sorted(cnt_g.items()):
+        put(k, n)
+    both = len([k for k in cnt_g if k]) >= 2
+    put("两张 GPU 是否都参与审核", "是" if both else ("否（只有一张卡处理过）" if cnt_g else "未记录"))
+    r0 += 1
+    put("说明：本报告由 AI 自动初筛生成，涉政无统一视觉标准，边界样本请人工复核。", None, None)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
 ''',
 "index.html": r'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2226,7 +3595,7 @@ button:hover{background:#26335c}button.pri{background:#0ea5e9;border-color:#0ea5
   <div class="bar">
     <div class="prog"><i id="pg"></i></div><span id="cnt">0 / 0</span>
     <button data-f="all" class="pri">全部</button><button data-f="pass">通过</button><button data-f="review">待复核</button><button data-f="block">拦截</button>
-    <button id="csv">导出 CSV</button><button id="clr">清空</button>
+    <button id="csv">导出 CSV</button><button id="xlsx" style="background:#16a34a;border-color:#16a34a;color:#fff;font-weight:700" title="含缩略图、涉政/涉黄/暴力等违规类别、汇总">📊 生成 Excel</button><button id="clr">清空</button>
   </div>
   <div id="grid"></div>
 </main>
@@ -2246,7 +3615,7 @@ function shrink(file,max=1280){return new Promise(res=>{const u=URL.createObject
  im.onerror=()=>res({blob:file,url:u});im.src=u})}
 function add(files){for(const f of files){if(!f.type.startsWith("image/"))continue;const it={file:f,state:"pending",id:items.length};items.push(it);}render();pump()}
 async function pump(){while(running<conc){const it=items.find(x=>x.state==="pending");if(!it)break;it.state="running";running++;run(it).finally(()=>{running--;pump()})}}
-async function run(it){try{const s=await shrink(it.file);it.url=s.url;render1(it);
+async function run(it){try{const s=await shrink(it.file);it.url=s.url;it.blob=s.blob;render1(it);
  const fd=new FormData();fd.append("file",s.blob,it.file.name);fd.append("mode",$("#mode").value);
  let r=await fetch("/api/analyze",{method:"POST",body:fd});
  for(let i=0;i<20&&r.status===503;i++){await new Promise(r=>setTimeout(r,3000));r=await fetch("/api/analyze",{method:"POST",body:fd})}
@@ -2279,6 +3648,18 @@ document.querySelectorAll("button[data-f]").forEach(b=>b.onclick=()=>{filter=b.d
 $("#clr").onclick=()=>{items.length=0;render()};
 $("#csv").onclick=()=>{const rows=[["文件名","结论","涉黄分","涉政分","暴力分","描述","原因","图中文字"]];for(const it of items){const r=it.res;rows.push([it.file.name,vkey(it),r?r.porn.score:"",r?r.political.score:"",r&&r.violence?r.violence.score:"",r?r.description:it.err||"",r?r.reasons.join("; "):"",r?r.ocr_text||"":""])}
  const t="\ufeff"+rows.map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(",")).join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t],{type:"text/csv"}));a.download="审查结果.csv";a.click()};
+
+function thumb(it){return new Promise(res=>{const src=it.blob||it.file;if(!src){res(null);return}const u=URL.createObjectURL(src);const im=new Image();
+ im.onload=()=>{const r=Math.min(1,320/Math.max(im.width,im.height));const c=document.createElement("canvas");c.width=Math.max(1,Math.round(im.width*r));c.height=Math.max(1,Math.round(im.height*r));
+  c.getContext("2d").drawImage(im,0,0,c.width,c.height);const d=c.toDataURL("image/jpeg",.8);URL.revokeObjectURL(u);res(d)};
+ im.onerror=()=>{URL.revokeObjectURL(u);res(null)};im.src=u})}
+$("#xlsx").onclick=async()=>{const done=items.filter(i=>i.state==="done"||i.state==="error");if(!done.length){alert("还没有审核结果");return}
+ const b=$("#xlsx"),t=b.textContent;b.disabled=true;b.textContent="生成中…";
+ try{const rows=[];let n=0;for(const it of done){rows.push({idx:++n,kind:"upload",name:it.file.name,res:it.res||null,err:it.err||"",image:await thumb(it)})}
+  const r=await fetch("/api/export/xlsx",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({title:"图片智能审查报告",rows})});
+  if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||("HTTP "+r.status))}
+  const blob=await r.blob();const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="图片审核报告-"+new Date().toISOString().slice(0,10)+".xlsx";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),3000)}
+ catch(e){alert("生成 Excel 失败："+(e.message||e))}b.disabled=false;b.textContent=t};
 </script>
 </body>
 </html>
@@ -2290,6 +3671,7 @@ $("#csv").onclick=()=>{const rows=[["文件名","结论","涉黄分","涉政分"
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>自动爬取并审查网络照片 · Kaggle GPU</title>
 <style>
+.tag.wall{background:#374151;color:#d1d5db}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;color:#e5e9f5;font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
 header{display:flex;gap:12px;align-items:center;padding:12px 18px;background:#070b17;border-bottom:1px solid #1d2744;position:sticky;top:0;z-index:5;flex-wrap:wrap}
 h1{font-size:16px;margin:0}.pill{padding:3px 10px;border-radius:99px;background:#1d2744;font-size:12px}.ok{background:#064e3b;color:#6ee7b7}.bad{background:#7f1d1d;color:#fca5a5}.warn{background:#78350f;color:#fcd34d}
@@ -2327,19 +3709,22 @@ button.pri{background:#10b981;border-color:#10b981;color:#052e1f;font-weight:700
     <div class="row">
       <div><label>或：平台搜索</label><select id="platform"><option value="xiaohongshu">小红书</option><option value="douyin">抖音</option><option value="weibo">微博</option><option value="bilibili">哔哩哔哩</option><option value="baidu">百度图片</option><option value="bing">必应图片</option><option value="custom">仅用上面的网址</option></select></div>
       <div><label>搜索关键词（可空）</label><input id="kw" placeholder="例如：穿搭"></div>
-      <div><label>采集方式</label><select id="mode"><option value="both">图片 + 截图（最全）</option><option value="images">只抓图片</option><option value="screenshot">只截图</option></select></div>
+      <div><label>采集方式</label><select id="mode"><option value="video">🎬 视频画面（推荐：抽取视频帧）</option><option value="all">视频 + 图片 + 截图</option><option value="both">图片 + 截图（旧）</option><option value="images">只抓图片</option><option value="screenshot">只截图</option></select></div>
+      <div><label>每个视频抽几帧</label><input id="fpv" type="number" value="6" min="1" max="24"></div>
+      <div><label>最多视频数</label><input id="vlim" type="number" value="10" min="1" max="60"></div>
       <div><label>最多张数</label><input id="max" type="number" value="60" min="1" max="600"></div>
       <div><label>滚动屏数</label><input id="scrolls" type="number" value="8" min="0" max="60"></div>
       <div><label>最小边长(px)</label><input id="min" type="number" value="200"></div>
       <div><label>审核模式</label><select id="amode"><option value="full">完整（大模型描述，最准）</option><option value="fast">快速（仅分类器）</option></select></div>
     </div>
     <div class="row">
-      <div><label><input id="deep" type="checkbox" style="width:auto"> 深入作品详情（逐个打开作品页）</label></div>
+      <div><label><input id="deep" type="checkbox" style="width:auto" checked> 深入作品详情（从列表/搜索页逐个打开作品）</label></div>
       <div><label><input id="mobile" type="checkbox" style="width:auto"> 手机端页面（竖屏截图）</label></div>
     </div>
-    <div style="margin-top:10px"><label>Cookie（可选：你自己账号的登录态，只在内存中使用、不保存；系统不会绕过登录/验证码）</label><input id="cookie" placeholder="a=1; b=2"></div>
-    <div style="margin-top:12px;display:flex;gap:8px"><button class="pri" id="go">▶ 开始爬取并审核</button><button class="stop" id="stop" disabled>■ 停止</button><button id="csv">导出 CSV</button></div>
-    <div class="note">合规提示：仅用于内容审核 / 自有或已获授权的内容，并遵守目标平台服务条款。遇到登录或验证码页面时只会提示，不会绕过。</div>
+    <div style="margin-top:10px"><label>Cookie（可选：你自己账号的登录态，支持 a=1; b=2 / Cookie-Editor JSON / cookies.txt；只在内存中使用、不保存；系统不会绕过登录/验证码）</label><input id="cookie" placeholder="a=1; b=2"></div>
+    <div style="margin-top:12px;display:flex;gap:8px"><button class="pri" id="go">▶ 开始爬取并审核</button><button class="stop" id="stop" disabled>■ 停止</button><button id="csv">导出 CSV</button><button id="xlsx" style="background:#16a34a;border-color:#16a34a;color:#fff;font-weight:700" title="含缩略图、涉政/涉黄/暴力等违规类别、汇总">📊 生成 Excel</button></div>
+    <div class="note">合规提示：仅用于内容审核 / 自有或已获授权的内容，并遵守目标平台服务条款。遇到登录或验证码页面时只会提示，不会绕过；被登录墙遮住的页面不会截图，识别出的登录墙截图会单独放进「🔒 登录墙」页签并排除出统计和 Excel。</div>
+    <div class="note" style="color:#7dd3fc">想审核视频？直接粘贴【具体的视频链接】最稳（抖音 / B站 走公开解析，不用登录）；搜索页/推荐页大多需要登录，请改填你自己账号的 Cookie。</div>
   </div>
   <div class="panel">
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b id="state">未开始</b><span id="stats"></span></div>
@@ -2360,7 +3745,7 @@ async function health(){try{const h=await (await fetch("/api/health")).json();
  }catch(e){$("#st").textContent="未连接";$("#st").className="pill bad"}}
 setInterval(health,5000);health();
 function body(){return{urls:$("#urls").value.split(/\n/).filter(x=>x.trim()),platform:$("#platform").value,keyword:$("#kw").value,mode:$("#mode").value,
- max_images:+$("#max").value,scrolls:+$("#scrolls").value,min_size:+$("#min").value,analyze_mode:$("#amode").value,deep:$("#deep").checked,mobile:$("#mobile").checked,cookie:$("#cookie").value}}
+ max_images:+$("#max").value,frames_per_video:+$("#fpv").value,video_limit:+$("#vlim").value,scrolls:+$("#scrolls").value,min_size:+$("#min").value,analyze_mode:$("#amode").value,deep:$("#deep").checked,mobile:$("#mobile").checked,cookie:$("#cookie").value}}
 $("#go").onclick=async()=>{
  const r=await fetch("/api/crawl/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body())});
  const j=await r.json();if(!r.ok){alert(j.detail||"启动失败");return}
@@ -2370,25 +3755,33 @@ async function poll(){clearTimeout(timer);if(!job)return;
  try{const j=await (await fetch("/api/crawl/"+job+"?since="+since)).json();since=j.rev;for(const it of j.items)items.set(it.idx,it);
   const s=j.stats,fin=s.analyzed+s.errors,tot=Math.max(1,j.total);
   $("#state").textContent=({queued:"排队中",running:"⏳ 爬取并审核中…",done:"✅ 已完成",stopped:"■ 已停止",error:"❌ 出错"})[j.state]+"  "+j.elapsed+"s";
-  $("#stats").textContent="抓到图片 "+s.found+" · 截图 "+s.screenshots+" · 已审核 "+s.analyzed+" · 拦截 "+s.block+" · 待复核 "+s.review+" · 通过 "+s.pass+" · 重复/过小 "+(s.dup+s.small);
+  $("#stats").textContent="视频 "+(s.videos||0)+" → 抽帧 "+(s.frames||0)+" · 图片 "+s.found+" · 截图 "+s.screenshots+" · 已审核 "+s.analyzed+" · 拦截 "+s.block+" · 待复核 "+s.review+" · 通过 "+s.pass+" · 登录墙排除 "+(s.walls||0)+" · 重复/过小 "+(s.dup+s.small);
   $("#pg").style.width=Math.round(fin/tot*100)+"%";
   $("#gp").innerHTML=(j.gpu_stats||[]).map(g=>'<div class="g"><b>GPU'+g.index+'</b> '+(g.busy?"● 工作中":g.ready?"○ 空闲":"◌ 加载中")+(g.mem_used_gb!=null?" · "+g.mem_used_gb+"/"+g.mem_total_gb+"G":"")+" · 已处理 "+g.processed+"</div>").join("");
   $("#log").textContent=j.logs.join("\n");$("#log").scrollTop=1e9;render();
   if(["done","stopped","error"].includes(j.state)){$("#go").disabled=false;$("#stop").disabled=true;return}
  }catch(e){}
  timer=setTimeout(poll,1000)}
-function render(){const arr=[...items.values()];const cnt=k=>arr.filter(i=>k==="all"||(i.res?i.res.verdict===k:k==="pending"&&i.status!=="error")).length;
- $("#tabs").innerHTML=[["all","全部"],["block","🚫 拦截"],["review","⚠️ 待复核"],["pass","✅ 通过"],["pending","⏳ 处理中"]].map(([k,t])=>'<button data-k="'+k+'" class="'+(filter===k?"on":"")+'">'+t+" "+cnt(k)+"</button>").join("");
+const isWall=i=>!!i.wall;
+const key=i=>isWall(i)?"wall":(i.res?i.res.verdict:(i.status==="error"||i.status==="skipped"?"error":"pending"));
+const KIND={frame:"🎬 视频帧",cover:"🖼️ 封面",image:"🖼️ 图片",screenshot:"📸 截图"};
+function render(){const arr=[...items.values()];const cnt=k=>arr.filter(i=>k==="all"?!isWall(i):key(i)===k).length;
+ $("#tabs").innerHTML=[["all","全部"],["block","🚫 拦截"],["review","⚠️ 待复核"],["pass","✅ 通过"],["pending","⏳ 处理中"],["wall","🔒 登录墙(已排除)"]].map(([k,t])=>'<button data-k="'+k+'" class="'+(filter===k?"on":"")+'">'+t+" "+cnt(k)+"</button>").join("");
  $("#tabs").querySelectorAll("button").forEach(b=>b.onclick=()=>{filter=b.dataset.k;render()});
- const list=arr.filter(i=>filter==="all"||(i.res?i.res.verdict===filter:filter==="pending"&&i.status!=="error")).sort((a,b)=>{const w=i=>i.res?({block:3,review:2,pass:1})[i.res.verdict]:0;return w(b)-w(a)||a.idx-b.idx});
- $("#grid").innerHTML=list.map(i=>{const v=i.res?i.res.verdict:"pending";const base="/api/crawl/"+job+"/";
-  return '<div class="card"><a href="'+base+'img/'+i.idx+'" target="_blank"><img loading="lazy" src="'+base+'thumb/'+i.idx+'"></a><div class="b"><span class="tag '+v+'">'+(VT[v]||(i.status==="error"?"❌ 失败":"⏳ 审核中"))+"</span> "+(i.kind==="screenshot"?"📸":"🖼️")+" "+i.w+"×"+i.h+
-  '<div class="d">'+(i.res?esc(i.res.description||""):esc(i.err||""))+"</div>"+(i.res&&i.res.reasons&&i.res.reasons.length?'<div class="d" style="color:#fcd34d">'+i.res.reasons.map(esc).join("；")+"</div>":"")+
+ const list=arr.filter(i=>filter==="all"?!isWall(i):key(i)===filter).sort((a,b)=>{const w=i=>i.res&&!isWall(i)?({block:3,review:2,pass:1})[i.res.verdict]:0;return w(b)-w(a)||a.idx-b.idx});
+ $("#grid").innerHTML=list.map(i=>{const k=key(i);const v=i.res&&!isWall(i)?i.res.verdict:"pending";const base="/api/crawl/"+job+"/";
+  return '<div class="card"><a href="'+base+'img/'+i.idx+'" target="_blank"><img loading="lazy" src="'+base+'thumb/'+i.idx+'"></a><div class="b"><span class="tag '+v+'">'+(k==="wall"?"🔒 登录墙":VT[v]||(i.status==="error"?"❌ 失败":"⏳ 审核中"))+"</span> "+(KIND[i.kind]||"🖼️")+(i.ts!=null?" "+i.ts+"s":"")+" "+i.w+"×"+i.h+
+  '<div class="d">'+(i.res?esc(i.res.description||""):esc(i.err||""))+"</div>"+(i.res&&i.res.reasons&&i.res.reasons.length&&k!=="wall"?'<div class="d" style="color:#fcd34d">'+i.res.reasons.map(esc).join("；")+"</div>":"")+
   '<div class="d"><a style="color:#7dd3fc" target="_blank" href="'+esc(i.page)+'">来源页</a></div></div></div>'}).join("")}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c])}
 $("#csv").onclick=()=>{const q=v=>'"'+String(v==null?"":v).replace(/"/g,'""')+'"';const rows=[["序号","类型","结论","描述","原因","图片地址","来源页"].map(q).join(",")];
  for(const i of items.values())rows.push([i.idx,i.kind,i.res?i.res.verdict:i.status,i.res?i.res.description:i.err,i.res?(i.res.reasons||[]).join("；"):"",i.src,i.page].map(q).join(","));
  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["\ufeff"+rows.join("\n")],{type:"text/csv"}));a.download="爬取审核结果.csv";a.click()};
+
+$("#xlsx").onclick=async()=>{if(!job){alert("还没有爬取任务");return}const b=$("#xlsx");b.disabled=true;const t=b.textContent;b.textContent="生成中…";
+ try{const r=await fetch("/api/crawl/"+job+"/xlsx");if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||("HTTP "+r.status))}
+  const blob=await r.blob();const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="爬取审核报告-"+new Date().toISOString().slice(0,10)+".xlsx";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),3000)}
+ catch(e){alert("生成 Excel 失败："+(e.message||e))}b.disabled=false;b.textContent=t};
 </script>
 </body>
 </html>
@@ -2402,7 +3795,7 @@ print("✅ 文件已写入:", {k: len(v) for k, v in _FILES.items()})
 # ---------------- 安装依赖 ----------------
 # ===== Kaggle Cell 1：安装依赖 + 创建目录 + 下载 cloudflared（只需运行一次）=====
 # 前置条件（右侧 Settings 面板）：Accelerator = GPU T4 x2，Internet = On
-import importlib, os, subprocess, sys, urllib.request
+import importlib, os, shutil, subprocess, sys, urllib.request
 
 APP_DIR = "/kaggle/working/app"
 os.makedirs(APP_DIR, exist_ok=True)
@@ -2445,6 +3838,15 @@ if not have("playwright"):
 sh(f"{PY} -m playwright install chromium")
 sh(f"{PY} -m playwright install-deps chromium", tail=600)
 
+# 2.6) v2.2 视频抽帧 + Excel：yt-dlp（解析 B站/微博等视频流）、openpyxl（生成 Excel）、imageio-ffmpeg（自带 ffmpeg 兜底）
+#      全部是可选增强：装不上只会让对应功能降级，不影响审核主流程
+sh(f"{PY} -m pip install -q -U yt-dlp openpyxl imageio-ffmpeg")
+if shutil.which("ffmpeg") is None:
+    sh("apt-get install -y -qq ffmpeg", tail=300)
+# 可选：Google Chrome（带 H.264 解码器，用于「浏览器播放截图」兜底；装不上不影响 ffmpeg 抽帧）。限时 5 分钟，失败自动跳过
+if not os.path.exists("/opt/google/chrome/chrome") and os.getenv("INSTALL_CHROME", "1") == "1":
+    sh(f"timeout 300 {PY} -m playwright install chrome", tail=300)
+
 # 3) 公网隧道：cloudflared（免账号）
 CF = "/kaggle/working/cloudflared"
 if not os.path.exists(CF):
@@ -2470,6 +3872,25 @@ _t = subprocess.run([PY, "-c", "from playwright.sync_api import sync_playwright 
                      "with s() as p:\n b=p.chromium.launch(args=['--no-sandbox','--disable-dev-shm-usage']);pg=b.new_page();pg.goto('about:blank');b.close()\nprint('ok')"],
                     capture_output=True, text=True)
 print("✅ Chromium 浏览器（网络照片自动爬取）" if "ok" in (_t.stdout or "") else "⚠️ Chromium 不可用（爬取将降级为 HTTP 模式）: " + ((_t.stderr or "")[-300:]))
+# v2.2 视频抽帧 / Excel 自检
+_ff = shutil.which("ffmpeg")
+if not _ff:
+    try:
+        import imageio_ffmpeg
+        _ff = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        _ff = None
+print("✅ ffmpeg（视频 → 截图）" if _ff else "⚠️ 没有 ffmpeg：视频抽帧不可用（图片/截图爬取不受影响）")
+print("✅ yt-dlp（解析 B站/微博等视频）" if have("yt_dlp") else "⚠️ 缺失 yt-dlp（抖音/B站仍可走内置公开解析）")
+print("✅ openpyxl（生成 Excel）" if have("openpyxl") else "⚠️ 缺失 openpyxl：服务端「生成 Excel」不可用（网页端仍可在浏览器里生成）")
+print("✅ Google Chrome（H.264）" if os.path.exists("/opt/google/chrome/chrome") else "ℹ️ 未安装 Chrome：视频帧由 ffmpeg 抽取，不受影响")
+if os.path.exists(f"{APP_DIR}/videoframes.py"):
+    sys.path.insert(0, APP_DIR)
+    try:
+        import videoframes
+        print(videoframes.selftest())
+    except Exception as _e:
+        print("⚠️ 抽帧自检异常:", str(_e)[:120])
 print("✅ Cell 1 完成：下一步运行启动 Cell")
 
 # ---------------- 启动服务 + 公网网址 ----------------

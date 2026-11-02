@@ -98,7 +98,7 @@ export default function CodeViewer({ initialTab = "github" }: { initialTab?: Tab
             <p>2. 标“覆盖”的文件：点右侧「在 GitHub 编辑」，全选后粘贴，Commit。标“无需修改”的跳过。</p>
             <p>3. 懒人做法：点「下载 ZIP」解压后，在仓库页面 Add file → Upload files，把整个文件夹拖进去，Commit。</p>
             <p>4. <b className="text-amber-300">kaggle/code1</b> 就是最新的「一键运行 Cell」，务必覆盖，否则 GitHub 里仍是旧版本。</p>
-            <p>5. <b className="text-red-300">重要：</b>GitHub 上的 <b>src/lib/codeFiles.ts</b> 曾被删除，导致网站无法构建；本次它标为“新增”，请务必补回。另有新增 <b>src/components/Insights.tsx</b>。</p>
+            <p>5. <b className="text-emerald-300">v2.2 本次更新：</b>新增 <b>kaggle/videoframes.py</b>（视频抽帧）、<b>kaggle/report.py</b>（服务端 Excel）、<b>src/lib/excel.ts</b>（浏览器端 Excel）；覆盖 crawler.py / server.py / crawl.html / index.html / cell1_install.py / CrawlerPanel.tsx / ModerationApp.tsx / codeFiles.ts / package.json（新增 exceljs 依赖）等——以上面的“新增 / 覆盖”标记为准。</p>
             <p>6. 提交后 Settings → Pages → Source 选 GitHub Actions，1 分钟后网站自动更新。</p>
           </>
         ) : (
@@ -106,7 +106,7 @@ export default function CodeViewer({ initialTab = "github" }: { initialTab?: Tab
             <p>1. 新建 Kaggle Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 x2</b>，Internet 选 <b>On</b>。</p>
             <p>2. 复制下面的「★ 一键运行 Cell」，粘贴到 Notebook 的一个 Cell，点运行（首次下载模型约 3~8 分钟）。</p>
             <p>3. 输出的 <b>https://xxxx.trycloudflare.com</b> 就是网址：直接打开即完整网页版；也可填到本站「设置」里连接 GPU。</p>
-            <p>4. v2.0：两张 T4 各跑一份完整模型（分类器×2 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL），<b>同时各处理一张图</b>；加载是串行的（避免 meta tensor 竞态），GPU0 好了就能用。</p>
+            <p>4. 两张 T4 各跑一份完整模型（分类器×2 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL），<b>同时各处理一张图</b>（爬取的视频帧也由两张卡同时抢活）；加载是串行的（避免 meta tensor 竞态），GPU0 好了就能用。</p>
             <p>5. 更强但更慢：在启动 Cell 顶部取消注释 <code>PROFILE=max</code>（7B 两卡切分）。大模型自检失败会自动回退，不会让系统不可用。</p>
           </>
         )}

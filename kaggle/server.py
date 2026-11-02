@@ -1,5 +1,5 @@
 """
-图片审查系统 v2.1 - Kaggle GPU 服务端 (FastAPI)
+图片审查系统 v2.2 - Kaggle GPU 服务端 (FastAPI)
 
 设计要点（第一性原则：吞吐 = GPU 利用率 × 并行度；准确率 = 多信号交叉验证 × 区域级覆盖）
 1. T4 x2：每张 GPU 各加载一份完整模型副本（数据并行），请求由空闲副本抢占处理。
@@ -18,6 +18,8 @@
 5. 环境变量 MOCK=1 时不加载任何模型，仅用于接口联调。
 6. v2.1 新增「自动爬取并审核网络照片」（crawler.py）：Playwright 无头浏览器抓图/截图（抖音、小红书、微博、B站、百度/必应图片、任意网址），
    抓到即审，流水线并发数 = 副本数x3，两张 T4 同时满载。接口：POST /api/crawl/start、GET /api/crawl/{id}、POST /api/crawl/{id}/stop。
+7. v2.2：爬取以【视频画面】为主（videoframes.py：公开解析器/yt-dlp/抓包 → ffmpeg 抽帧 → 每帧送审），自动识别并排除「登录墙」截图；
+   新增「生成 Excel」：GET /api/crawl/{id}/xlsx、POST /api/export/xlsx（report.py，含缩略图 + 涉政/涉黄/暴力等违规类别 + 汇总）。
 
 环境变量:
   PORT(8000)  PROFILE=fast|balanced|max   (balanced 默认；max=7B 两卡切分)
@@ -46,7 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageDraw, ImageOps
 
 try:  # v2.1 爬取模块：缺失或异常只会让爬取功能不可用，不影响审核主流程
@@ -55,11 +57,17 @@ except Exception as _e:  # noqa: BLE001
     crawler = None  # type: ignore
     print("crawler 模块加载失败（爬取功能不可用）:", _e)
 
+try:  # v2.2 Excel 报告：缺失（或缺 openpyxl）只影响「生成 Excel」，不影响审核
+    import report
+except Exception as _re:  # noqa: BLE001
+    report = None  # type: ignore
+    print("report 模块加载失败（生成 Excel 不可用）:", _re)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("moderation")
 
 BASE_DIR = Path(__file__).resolve().parent
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 MOCK = os.getenv("MOCK") == "1"
 PROFILE = os.getenv("PROFILE", "balanced").lower()
 MAX_BYTES = 40 * 1024 * 1024
@@ -1439,6 +1447,45 @@ async def crawl_image(job_id: str, kind: str, idx: int):
     if kind not in ("thumb", "img") or not p:
         raise HTTPException(404, "图片不存在")
     return FileResponse(str(p), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+def _xlsx_response(data: bytes, name: str) -> Response:
+    from urllib.parse import quote
+
+    return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename=\"report.xlsx\"; filename*=UTF-8''%s" % quote(name),
+                             "Cache-Control": "no-store"})
+
+
+@app.get("/api/crawl/{job_id}/xlsx")
+async def crawl_xlsx(job_id: str, include_wall: int = 0) -> Response:
+    """爬取任务结果 → Excel（每行一张图的缩略图 + 结论 + 违规类别 + 汇总）"""
+    j = _job(job_id)
+    if report is None:
+        raise HTTPException(501, "Excel 模块未加载（缺少 kaggle/report.py 或 openpyxl）")
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(None, lambda: crawler.export_xlsx(j, bool(include_wall)))  # type: ignore[union-attr]
+    except Exception as e:  # noqa: BLE001
+        log.exception("生成 Excel 失败")
+        raise HTTPException(500, "生成 Excel 失败: %s" % str(e)[:200])
+    return _xlsx_response(data, "爬取审核报告-%s.xlsx" % time.strftime("%Y%m%d-%H%M%S"))
+
+
+@app.post("/api/export/xlsx")
+async def export_xlsx(body: Dict[str, Any]) -> Response:
+    """图片审核页：前端把 {title, rows:[{name, image(dataURL), res, kind, ...}]} 交过来，服务端生成 Excel"""
+    if report is None:
+        raise HTTPException(501, "Excel 模块未加载（缺少 kaggle/report.py 或 openpyxl）")
+    rows = report.rows_from_payload(body)
+    if not rows:
+        raise HTTPException(400, "没有可导出的审核结果")
+    meta = {"title": str(body.get("title") or "图片智能审查报告"), "mode": ""}
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(None, lambda: report.build_xlsx(rows, meta))
+    except Exception as e:  # noqa: BLE001
+        log.exception("生成 Excel 失败")
+        raise HTTPException(500, "生成 Excel 失败: %s" % str(e)[:200])
+    return _xlsx_response(data, "图片审核报告-%s.xlsx" % time.strftime("%Y%m%d-%H%M%S"))
 
 
 @app.get("/crawl")

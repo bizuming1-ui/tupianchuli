@@ -100,7 +100,7 @@ export interface HealthInfo {
   warnings?: string[];
   loading_done?: boolean;
   /** v2.1：爬取模块能力（playwright/chromium 是否可用） */
-  crawler?: { playwright: boolean; chromium: boolean; engine: string };
+  crawler?: { playwright: boolean; chromium: boolean; engine: string; chrome?: boolean; video?: boolean; ffmpeg?: boolean; ytdlp?: boolean };
 }
 
 export type ItemStatus = "queued" | "running" | "done" | "error";

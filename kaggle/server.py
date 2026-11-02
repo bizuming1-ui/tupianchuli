@@ -47,7 +47,31 @@ VLM_MAX_PIXELS = int(os.getenv("VLM_MAX_PIXELS", str(640 * 28 * 28)))
 DISABLE_VLM = os.getenv("DISABLE_VLM") == "1"
 VLM_SHARD = os.getenv("VLM_SHARD") == "1"  # 大模型(7B)跨两张卡切分，只有 1 个副本
 MAX_BYTES = 40 * 1024 * 1024
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# 【关键修复】transformers/accelerate 的"meta 设备初始化"是进程级全局状态，
+# 两个线程同时 from_pretrained 会互相污染 -> "Cannot copy out of meta tensor"。
+# 所以所有 from_pretrained 必须串行（全局锁），并且加载后校验不能残留 meta 张量。
+LOAD_LOCK = threading.RLock()
+
+
+def _dtype_key() -> str:
+    """transformers>=4.56 用 dtype，旧版本用 torch_dtype（旧版传 dtype 会被静默当成 config 参数，导致仍是 fp32）"""
+    try:
+        import transformers
+        nums = re.findall(r"\d+", transformers.__version__)[:2]
+        return "dtype" if (int(nums[0]), int(nums[1])) >= (4, 56) else "torch_dtype"
+    except Exception:
+        return "torch_dtype"
+
+
+def _has_meta(model) -> bool:
+    try:
+        return any(getattr(p, "is_meta", False) or p.device.type == "meta" for p in model.parameters()) or any(
+            b.device.type == "meta" for b in model.buffers())
+    except Exception:
+        return False
+
 
 DEFAULT_KEYWORDS = [
     "法轮功", "法轮大法", "六四", "天安门事件", "藏独", "疆独", "台独", "港独",
@@ -242,29 +266,53 @@ class Replica:
         self.torch = None
 
     # ---- 加载 ----
+    def _load_small(self, cls, name: str, dtype):
+        """加载小模型：先 CPU 完整加载 -> 校验无 meta -> 再搬到本卡。失败则关闭 low_cpu_mem_usage 重试。"""
+        import gc
+        key = _dtype_key()
+        last: Optional[Exception] = None
+        for attempt, extra in enumerate(({}, {"low_cpu_mem_usage": False})):
+            try:
+                with LOAD_LOCK:
+                    m = cls.from_pretrained(name, **{key: dtype}, **extra)
+                    if _has_meta(m):
+                        raise RuntimeError("模型含 meta 张量（第 %d 次尝试）" % (attempt + 1))
+                    m = m.to(self.device).eval()
+                return m
+            except Exception as e:  # noqa: BLE001
+                last = e
+                log.warning("[%s] 加载 %s 失败(第 %d 次): %s", self.device, name, attempt + 1, str(e)[:160])
+                gc.collect()
+                if self.torch is not None and self.torch.cuda.is_available():
+                    self.torch.cuda.empty_cache()
+        raise RuntimeError("加载 %s 失败: %s" % (name, last))
+
     def load(self) -> None:
         t0 = time.time()
         if MOCK:
             time.sleep(0.5)
             return
-        import torch
-        from transformers import (AutoImageProcessor, AutoModelForImageClassification, AutoProcessor,
-                                  CLIPModel, CLIPProcessor)
+        with LOAD_LOCK:  # transformers 的懒加载 import 同样不是线程安全的
+            import torch
+            from transformers import (AutoImageProcessor, AutoModelForImageClassification,
+                                      CLIPModel, CLIPProcessor)
 
         self.torch = torch
         use_cuda = self.device.startswith("cuda")
         dtype = torch.float16 if use_cuda else torch.float32
 
         log.info("[%s] 加载 NSFW 分类器 %s", self.device, NSFW_MODEL)
-        self.nsfw_proc = AutoImageProcessor.from_pretrained(NSFW_MODEL)
-        self.nsfw = AutoModelForImageClassification.from_pretrained(NSFW_MODEL, torch_dtype=dtype).to(self.device).eval()
+        with LOAD_LOCK:
+            self.nsfw_proc = AutoImageProcessor.from_pretrained(NSFW_MODEL)
+        self.nsfw = self._load_small(AutoModelForImageClassification, NSFW_MODEL, dtype)
         for i, name in self.nsfw.config.id2label.items():
             if "nsfw" in str(name).lower() or "porn" in str(name).lower():
                 self.nsfw_idx = int(i)
 
         log.info("[%s] 加载 CLIP %s", self.device, CLIP_MODEL)
-        self.clip_proc = CLIPProcessor.from_pretrained(CLIP_MODEL)
-        self.clip = CLIPModel.from_pretrained(CLIP_MODEL, torch_dtype=dtype).to(self.device).eval()
+        with LOAD_LOCK:
+            self.clip_proc = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        self.clip = self._load_small(CLIPModel, CLIP_MODEL, dtype)
         prompts = [p for p, _ in NEUTRAL] + PORN + SUGGESTIVE + [p for p, _ in POLITICAL]
         with torch.inference_mode():
             tok = self.clip_proc(text=prompts, return_tensors="pt", padding=True).to(self.device)
@@ -280,6 +328,7 @@ class Replica:
         log.info("[%s] 副本就绪，用时 %.1fs，VLM=%s", self.device, time.time() - t0, self.has_vlm)
 
     def _load_vlm(self) -> None:
+        import gc
         import torch
         from transformers import AutoProcessor
         try:
@@ -287,19 +336,37 @@ class Replica:
         except ImportError:  # 旧版本 transformers
             from transformers import AutoModelForVision2Seq as Auto
 
+        key = _dtype_key()
         log.info("[%s] 加载视觉大模型 %s", self.device, VLM_MODEL)
-        self.proc = AutoProcessor.from_pretrained(VLM_MODEL, min_pixels=128 * 28 * 28, max_pixels=VLM_MAX_PIXELS)
-        if VLM_SHARD:
-            self.vlm = Auto.from_pretrained(
-                VLM_MODEL, torch_dtype=torch.float16, device_map="auto",
-                max_memory={i: "13GiB" for i in range(torch.cuda.device_count())},
-            ).eval()
-        else:
-            idx = int(self.device.split(":")[1]) if ":" in self.device else 0
-            self.vlm = Auto.from_pretrained(
-                VLM_MODEL, torch_dtype=torch.float16, device_map={"": idx}, attn_implementation="sdpa",
-            ).eval()
-        self.has_vlm = True
+        last: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                with LOAD_LOCK:
+                    self.proc = AutoProcessor.from_pretrained(VLM_MODEL, min_pixels=128 * 28 * 28, max_pixels=VLM_MAX_PIXELS)
+                    if VLM_SHARD:
+                        m = Auto.from_pretrained(
+                            VLM_MODEL, **{key: torch.float16}, device_map="auto",
+                            max_memory={i: "13GiB" for i in range(torch.cuda.device_count())})
+                    else:
+                        idx = int(self.device.split(":")[1]) if ":" in self.device else 0
+                        if attempt == 0:  # 直接加载到本卡（最快、最省内存）
+                            m = Auto.from_pretrained(VLM_MODEL, **{key: torch.float16}, device_map={"": idx},
+                                                     attn_implementation="sdpa")
+                        else:  # 兜底：CPU 完整加载后再搬运
+                            m = Auto.from_pretrained(VLM_MODEL, **{key: torch.float16}, low_cpu_mem_usage=False,
+                                                     attn_implementation="sdpa").to(self.device)
+                    if _has_meta(m):
+                        raise RuntimeError("VLM 含 meta 张量")
+                    self.vlm = m.eval()
+                self.has_vlm = True
+                return
+            except Exception as e:  # noqa: BLE001
+                last = e
+                log.warning("[%s] VLM 加载失败(第 %d 次): %s", self.device, attempt + 1, str(e)[:160])
+                self.vlm = None
+                gc.collect()
+                torch.cuda.empty_cache()
+        raise RuntimeError("VLM 加载失败: %s" % last)
 
     # ---- 推理 ----
     def _classify(self, img: Image.Image) -> float:
@@ -426,7 +493,8 @@ class Pool:
         self.free: Optional[asyncio.Queue] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.ready_count = 0
-        self.loading_error: Optional[str] = None
+        self.load_errors: List[str] = []
+        self.load_done = False
         self.inflight = 0
         self.done = 0
         self.total_ms = 0
@@ -457,21 +525,16 @@ class Pool:
         threading.Thread(target=self._load_all, daemon=True).start()
 
     def _load_all(self) -> None:
-        # 各 GPU 并行加载，加载完一个就立刻开始接活
-        def one(r: Replica) -> None:
+        # 【串行】逐张 GPU 加载（并行会触发 meta tensor 竞态）。加载完一张立刻开始接活，第二张在后台继续。
+        for r in self.replicas:
             try:
                 r.load()
                 self.ready_count += 1
                 self.loop.call_soon_threadsafe(self.free.put_nowait, r)  # type: ignore
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 log.exception("副本 %s 加载失败", r.device)
-                self.loading_error = "%s: %s" % (r.device, e)
-
-        threads = [threading.Thread(target=one, args=(r,)) for r in self.replicas]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+                self.load_errors.append("%s: %s" % (r.device, str(e)[:300]))
+        self.load_done = True
 
     @property
     def ready(self) -> bool:
@@ -508,7 +571,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def health() -> Dict[str, Any]:
     r0 = pool.replicas[0] if pool.replicas else None
     return {
-        "status": "ok" if pool.ready else ("error" if pool.loading_error else "loading"),
+        "status": "ok" if pool.ready else ("error" if (pool.load_done and pool.load_errors) else "loading"),
         "ready": pool.ready,
         "version": VERSION,
         "mock": MOCK,
@@ -521,7 +584,9 @@ async def health() -> Dict[str, Any]:
         "processed": pool.done,
         "avg_ms": int(pool.total_ms / pool.done) if pool.done else 0,
         "uptime_s": int(time.time() - pool.started),
-        "error": pool.loading_error,
+        "error": ("; ".join(pool.load_errors) or "加载失败") if (pool.load_done and not pool.ready) else None,
+        "warnings": pool.load_errors if pool.ready else [],
+        "loading_done": pool.load_done,
     }
 
 

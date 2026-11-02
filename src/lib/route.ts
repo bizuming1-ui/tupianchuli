@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 
-export type Route = "app" | "code" | "site";
+export type Route = "app" | "code" | "site" | "crawl" | "sitecrawl";
 
 function parse(): Route {
   const h = window.location.hash;
   if (h.startsWith("#/code")) return "code";
+  if (h.startsWith("#/sitecrawl")) return "sitecrawl";
   if (h.startsWith("#/site")) return "site";
+  if (h.startsWith("#/crawl")) return "crawl";
   return "app";
 }
 

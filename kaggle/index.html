@@ -39,7 +39,7 @@ button:hover{background:#26335c}button.pri{background:#0ea5e9;border-color:#0ea5
   <div class="bar">
     <div class="prog"><i id="pg"></i></div><span id="cnt">0 / 0</span>
     <button data-f="all" class="pri">全部</button><button data-f="pass">通过</button><button data-f="review">待复核</button><button data-f="block">拦截</button>
-    <button id="csv">导出 CSV</button><button id="clr">清空</button>
+    <button id="csv">导出 CSV</button><button id="xlsx" style="background:#16a34a;border-color:#16a34a;color:#fff;font-weight:700" title="含缩略图、涉政/涉黄/暴力等违规类别、汇总">📊 生成 Excel</button><button id="clr">清空</button>
   </div>
   <div id="grid"></div>
 </main>
@@ -59,7 +59,7 @@ function shrink(file,max=1280){return new Promise(res=>{const u=URL.createObject
  im.onerror=()=>res({blob:file,url:u});im.src=u})}
 function add(files){for(const f of files){if(!f.type.startsWith("image/"))continue;const it={file:f,state:"pending",id:items.length};items.push(it);}render();pump()}
 async function pump(){while(running<conc){const it=items.find(x=>x.state==="pending");if(!it)break;it.state="running";running++;run(it).finally(()=>{running--;pump()})}}
-async function run(it){try{const s=await shrink(it.file);it.url=s.url;render1(it);
+async function run(it){try{const s=await shrink(it.file);it.url=s.url;it.blob=s.blob;render1(it);
  const fd=new FormData();fd.append("file",s.blob,it.file.name);fd.append("mode",$("#mode").value);
  let r=await fetch("/api/analyze",{method:"POST",body:fd});
  for(let i=0;i<20&&r.status===503;i++){await new Promise(r=>setTimeout(r,3000));r=await fetch("/api/analyze",{method:"POST",body:fd})}
@@ -92,6 +92,18 @@ document.querySelectorAll("button[data-f]").forEach(b=>b.onclick=()=>{filter=b.d
 $("#clr").onclick=()=>{items.length=0;render()};
 $("#csv").onclick=()=>{const rows=[["文件名","结论","涉黄分","涉政分","暴力分","描述","原因","图中文字"]];for(const it of items){const r=it.res;rows.push([it.file.name,vkey(it),r?r.porn.score:"",r?r.political.score:"",r&&r.violence?r.violence.score:"",r?r.description:it.err||"",r?r.reasons.join("; "):"",r?r.ocr_text||"":""])}
  const t="\ufeff"+rows.map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(",")).join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t],{type:"text/csv"}));a.download="审查结果.csv";a.click()};
+
+function thumb(it){return new Promise(res=>{const src=it.blob||it.file;if(!src){res(null);return}const u=URL.createObjectURL(src);const im=new Image();
+ im.onload=()=>{const r=Math.min(1,320/Math.max(im.width,im.height));const c=document.createElement("canvas");c.width=Math.max(1,Math.round(im.width*r));c.height=Math.max(1,Math.round(im.height*r));
+  c.getContext("2d").drawImage(im,0,0,c.width,c.height);const d=c.toDataURL("image/jpeg",.8);URL.revokeObjectURL(u);res(d)};
+ im.onerror=()=>{URL.revokeObjectURL(u);res(null)};im.src=u})}
+$("#xlsx").onclick=async()=>{const done=items.filter(i=>i.state==="done"||i.state==="error");if(!done.length){alert("还没有审核结果");return}
+ const b=$("#xlsx"),t=b.textContent;b.disabled=true;b.textContent="生成中…";
+ try{const rows=[];let n=0;for(const it of done){rows.push({idx:++n,kind:"upload",name:it.file.name,res:it.res||null,err:it.err||"",image:await thumb(it)})}
+  const r=await fetch("/api/export/xlsx",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({title:"图片智能审查报告",rows})});
+  if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||("HTTP "+r.status))}
+  const blob=await r.blob();const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="图片审核报告-"+new Date().toISOString().slice(0,10)+".xlsx";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),3000)}
+ catch(e){alert("生成 Excel 失败："+(e.message||e))}b.disabled=false;b.textContent=t};
 </script>
 </body>
 </html>

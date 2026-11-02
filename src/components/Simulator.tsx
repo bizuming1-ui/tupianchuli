@@ -4,6 +4,7 @@ import { copyText } from "@/lib/clipboard";
 import { currentSiteUrl, GH_PAGES_URL, GH_REPO_URL } from "@/lib/config";
 import type { Route } from "@/lib/route";
 import CodeViewer from "./CodeViewer";
+import CrawlerPanel from "./CrawlerPanel";
 import ModerationApp from "./ModerationApp";
 
 /**
@@ -50,11 +51,12 @@ export default function Simulator({ route, go }: { route: Route; go: (r: Route) 
   const copy = async (text: string, what: string) => say((await copyText(text)) ? `✓ 已复制：${what}` : "复制失败，请在代码界面手动全选复制");
 
   const submitAddr = () => {
-    const m = addr.match(/#\/(code|site|app)/);
+    const m = addr.match(/#\/(code|sitecrawl|site|crawl|app)/);
     go((m?.[1] as Route) || "app");
   };
 
   const inCode = route === "code";
+  const inCrawl = route === "crawl";
   const urlRow = (label: string, url: string, hint?: string) => (
     <div className="flex min-w-0 items-center gap-2 text-xs">
       <span className="w-[88px] shrink-0 text-slate-500">{label}</span>
@@ -78,8 +80,8 @@ export default function Simulator({ route, go }: { route: Route; go: (r: Route) 
           <i className="h-3 w-3 rounded-full bg-red-500" /><i className="h-3 w-3 rounded-full bg-yellow-400" /><i className="h-3 w-3 rounded-full bg-green-500" />
         </div>
         <div className="flex max-w-[260px] min-w-0 items-center gap-2 rounded-t-lg bg-[#0b1020] px-4 py-2 text-xs">
-          <span>{inCode ? "📋" : "🛡️"}</span>
-          <span className="truncate">{inCode ? "复制代码界面" : "图片智能审查系统"}</span>
+          <span>{inCode ? "📋" : inCrawl ? "🕸️" : "🛡️"}</span>
+          <span className="truncate">{inCode ? "复制代码界面" : inCrawl ? "自动爬取并审查网络照片" : "图片智能审查系统"}</span>
         </div>
         <div className="ml-auto mb-1.5 flex items-center gap-2" ref={menuRef}>
           <div className="relative">
@@ -131,7 +133,7 @@ export default function Simulator({ route, go }: { route: Route; go: (r: Route) 
 
       {/* 网页视口 */}
       <main className="relative min-h-0 flex-1 bg-slate-950">
-        {inCode ? <CodeViewer key={"c" + nonce} /> : <ModerationApp key={"a" + nonce} compact />}
+        {inCode ? <CodeViewer key={"c" + nonce} /> : inCrawl ? <CrawlerPanel key={"w" + nonce} onBack={() => go("app")} /> : <ModerationApp key={"a" + nonce} compact onOpenCrawl={() => go("crawl")} />}
         {toast && <div className="pointer-events-none absolute left-1/2 top-4 z-50 -translate-x-1/2 rounded-full bg-emerald-500 px-5 py-2 text-sm font-bold text-emerald-950 shadow-xl">{toast}</div>}
       </main>
     </div>

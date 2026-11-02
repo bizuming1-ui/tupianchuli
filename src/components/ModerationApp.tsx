@@ -139,7 +139,7 @@ function readApiParam(): string {
   return i >= 0 ? new URLSearchParams(h.slice(i + 1)).get("api") || "" : "";
 }
 
-export default function ModerationApp({ compact = false }: { compact?: boolean }) {
+export default function ModerationApp({ compact = false, onOpenCrawl }: { compact?: boolean; onOpenCrawl?: () => void }) {
   const [items, setItems] = useState<ScanItem[]>([]);
   const [filter, setFilter] = useState<Filter>("all");
   const [sortRisk, setSortRisk] = useState(false);
@@ -469,6 +469,9 @@ export default function ModerationApp({ compact = false }: { compact?: boolean }
             <button onClick={() => setSettingsOpen(true)} className={`rounded-full px-3 py-1.5 text-xs font-medium ring-1 ${pill.cls}`}>{pill.text}</button>
             <button onClick={() => { setHistory(loadHistory()); setHistoryOpen(true); }} className={btn}>🕘 历史</button>
             <button onClick={() => setSettingsOpen(true)} className={btn}>⚙️ 设置</button>
+            {onOpenCrawl && (
+              <button onClick={onOpenCrawl} title="在抖音 / 小红书等平台自动爬取或截图，并交给 Kaggle T4×2 精准审核" className="rounded-lg bg-emerald-500 px-3.5 py-1.5 text-xs font-bold text-emerald-950 shadow-lg shadow-emerald-900/40 transition hover:bg-emerald-400 active:scale-95">🕸️ 自动爬取并审查网络照片</button>
+            )}
           </header>
 
           {/* 上传区 */}

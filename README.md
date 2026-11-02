@@ -1,4 +1,4 @@
-## 图片智能审查系统 v2.0（涉黄 / 涉政 / 暴力 + 中文描述 + 区域级检测）
+## 图片智能审查系统 v2.1（涉黄 / 涉政 / 暴力 + 中文描述 + 区域级检测 + 自动爬取网络照片）
 
 批量上传 / 拖拽图片（不限数量，支持整个文件夹、Ctrl+V 粘贴），自动判断 **涉黄 / 涉政**（并提示暴力血腥），生成一句中文描述，
 并把风险**精确框在图上**。重计算全部跑在 **Kaggle T4 x2 GPU** 上；网站是纯静态页面（Vite + React），可部署在 GitHub Pages，也可直接用 Kaggle 自带的网页版。
@@ -37,6 +37,22 @@ Kaggle Notebook：FastAPI（kaggle/server.py）+ cloudflared 公网隧道
 > 不做人脸识别（识别具体政治人物既不可靠也有合规风险）。关键词可用环境变量 `POLITICAL_KEYWORDS` / `PORN_KEYWORDS` 追加。
 > 没连接 GPU 时网站进入「演示模式」（浏览器本地估计，不能判断涉政），连接后可一键用 AI 重审。
 
+### v2.1 新增：自动爬取并审查网络照片
+
+审查网站**右上角**新增绿色按钮 **「🕸️ 自动爬取并审查网络照片」**（Kaggle 自带网页版同位置也有，对应 `/crawl` 页面）。点击进入爬取界面：
+
+| 步骤 | 说明 |
+| --- | --- |
+| 输入 | 选择平台（抖音 / 小红书 / 微博 / B站 / 百度图片 / 必应图片 / 任意网址）+ 粘贴网址或整段分享文字（自动提取链接），或只填关键词自动生成搜索页 |
+| 抓取 | Playwright 无头 Chromium：① 拦截网络响应直接取图片字节 ② 扫描 DOM（img / srcset / data-src / 背景图 / poster）③ 逐屏页面截图（OCR 能读出截图里的文字）；可选「深入作品详情」逐个打开作品页 |
+| 审核 | 抓到一张立刻去重（SHA1 + 感知哈希）并送入 GPU 池，**两张 T4 同时抢活**，并发 = 副本数 × 3，前端实时显示每张卡忙/闲、显存、各卡完成数 |
+| 结果 | 拦截 / 待复核 / 通过 分类、检测框叠加、来源页、CSV 导出 |
+
+* 接口：`POST /api/crawl/start` · `GET /api/crawl/{id}?since=rev`（增量）· `POST /api/crawl/{id}/stop` · `GET /api/crawl/{id}/thumb|img/{idx}`；`/api/health` 增加 `crawler` 字段。
+* 没有 Chromium 时自动降级为 HTTP 模式（只能抓静态页面）；Kaggle Cell 1 会安装 Playwright + Chromium 并自检。
+* 旧的 `/api/analyze` 逻辑原样保留（抽成 `analyze_raw` 后与爬取共用同一条审核路径）。
+* **合规边界**：不破解验证码、不绕过登录、不做指纹伪装；遇到登录/验证码墙只提示。需要登录态时使用者提供自己账号的 Cookie（仅内存使用，不落盘）。默认禁止访问内网地址（SSRF 防护），请求之间有间隔。请仅用于内容审核/自有或已授权内容，并遵守平台服务条款。
+
 ## 在 Kaggle 上运行
 
 1. 新建 Notebook，Settings：Accelerator = **GPU T4 x2**，Internet = **On**。
@@ -63,6 +79,7 @@ npm run build    # 产物 dist/index.html（单文件）
 推送到 GitHub 后：Settings → Pages → Source 选 **GitHub Actions**，`.github/workflows/deploy.yml` 会自动发布。
 
 * `#/app` 浏览器模拟器 + 审查网站（默认）
+* `#/crawl` 浏览器模拟器 + 自动爬取并审查网络照片
 * `#/code` 浏览器模拟器 + 复制代码界面（与 GitHub 仓库逐文件比对：新增 / 覆盖 / 无需修改；ZIP 下载）
 * `#/site` 纯网站（无外壳）
 

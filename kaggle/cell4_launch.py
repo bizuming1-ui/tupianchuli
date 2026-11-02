@@ -55,19 +55,27 @@ print("   ", public_url)
 print("   该网址本身就是一个完整的网页版审查系统，可直接打开使用")
 print("=" * 66)
 
-# 4) 等待模型加载（首次需要下载约 6~8GB，约 3~8 分钟）
+# 4) 等待模型加载（首次需要下载约 6~8GB，约 3~8 分钟）。两张 GPU 是【串行】加载的：GPU0 好了就能用，GPU1 在后台继续。
 t0 = time.time()
 last = ""
-while time.time() - t0 < 1500:
+announced = False
+while time.time() - t0 < 1800:
     h = health()
     if h and h.get("ready"):
-        print(f"✅ 就绪！副本 {h['replicas_ready']}/{h['replicas']}，GPU: {[g['name'] for g in h['gpus']]}，大模型: {h['models']['vlm']}")
-        break
-    if h and h.get("error"):
-        print("❌ 加载失败:", h["error"]); break
+        if not announced:
+            announced = True
+            print(f"✅ 可以使用了！已就绪 GPU 副本 {h['replicas_ready']}/{h['replicas']}，GPU: {[g['name'] for g in h['gpus']]}，大模型: {h['models']['vlm']}")
+        if h.get("loading_done"):
+            print(f"✅ 全部加载完成：副本 {h['replicas_ready']}/{h['replicas']}，大模型: {h['models']['vlm']}")
+            for w in h.get("warnings") or []:
+                print("⚠️ 有副本加载失败（系统已自动降级继续运行）:", w)
+            break
+    elif h and h.get("error"):
+        print("❌ 加载失败:", h["error"]); print(open('/kaggle/working/server.log').read()[-2500:]); break
     if server.poll() is not None:
         print("❌ 服务进程退出，日志如下："); print(open('/kaggle/working/server.log').read()[-3000:]); break
-    tail = open("/kaggle/working/server.log").read().strip().split("\n")[-1][-110:]
+    tail = [l for l in open("/kaggle/working/server.log").read().strip().split("\n") if "INFO" in l or "WARNING" in l or "ERROR" in l]
+    tail = (tail[-1] if tail else "")[-110:]
     if tail != last:
         print("…加载中:", tail); last = tail
     time.sleep(5)

@@ -14,4 +14,9 @@ rapidocr_onnxruntime
 # torch 使用 Kaggle 自带版本，不要重装
 # --- v2.1 网络照片自动爬取（可选，缺失时降级为 HTTP 模式）---
 playwright
+# --- v2.2 视频抽帧 / Excel（可选，缺失时对应功能降级）---
+yt-dlp
+openpyxl
+imageio-ffmpeg
+# ffmpeg：Kaggle 自带；本地环境请 apt install ffmpeg 或依赖 imageio-ffmpeg
 # 安装后还需要：python -m playwright install chromium && python -m playwright install-deps chromium

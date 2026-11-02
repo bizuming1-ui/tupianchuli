@@ -55,36 +55,32 @@ const src = (p: string): string => RAW["/" + p] ?? "";
 const ROOT_ORDER = [
   "README.md", ".gitignore", "package.json", "tsconfig.json", "vite.config.ts", "index.html",
   ".github/workflows/deploy.yml",
-  "kaggle/server.py", "kaggle/crawler.py", "kaggle/index.html", "kaggle/crawl.html", "kaggle/requirements.txt", "kaggle/cell1_install.py",
+  "kaggle/server.py", "kaggle/crawler.py", "kaggle/videoframes.py", "kaggle/report.py", "kaggle/index.html", "kaggle/crawl.html", "kaggle/requirements.txt", "kaggle/cell1_install.py",
   "kaggle/cell4_launch.py", "kaggle/cell_alt_git_clone.py", "kaggle/code1",
 ];
 
 const ensureNl = (t: string) => (t.endsWith("\n") ? t : t + "\n");
 
-/** 合成「一键运行 Cell」：把 server.py / index.html 以 Python 原始字符串写入磁盘，再安装依赖、启动服务 */
+/** 一键运行 Cell 要写入 /kaggle/working/app 的文件（顺序无关；新增 Python 模块只需要在这里加一项） */
+const APP_FILES = ["server.py", "crawler.py", "videoframes.py", "report.py", "index.html", "crawl.html"];
+
+/** 合成「一键运行 Cell」：把 server.py / crawler.py / videoframes.py / report.py / 网页 以 Python 原始字符串写入磁盘，再安装依赖、启动服务 */
 export function buildOneClickCell(): string {
-  const server = src("kaggle/server.py");
-  const crawler = src("kaggle/crawler.py");
-  const index = src("kaggle/index.html");
-  const crawl = src("kaggle/crawl.html");
   const cell1 = src("kaggle/cell1_install.py");
   const cell4 = src("kaggle/cell4_launch.py");
-  for (const t of [server, crawler, index, crawl]) {
-    if (t.includes("'''")) throw new Error("server.py / crawler.py / index.html / crawl.html 含有三个连续单引号，无法内嵌为 Python 原始字符串");
+  for (const n of APP_FILES) {
+    if (src("kaggle/" + n).includes("'''")) throw new Error(`${n} 含有三个连续单引号，无法内嵌为 Python 原始字符串`);
   }
   return ensureNl(
     [
       "# ===== ★ 一键运行（推荐）：写入文件 → 安装依赖 → 启动 GPU 服务 → 生成公网网址 =====",
       "# 前置：Notebook 右侧 Settings → Accelerator 选 GPU T4 x2；Internet 打开 On",
-      "# 只需要把这一整段粘贴到 1 个 Cell 里，点运行即可。（v2.1：双分类器 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL，带自检回退；新增 自动爬取并审查网络照片）",
+      "# 只需要把这一整段粘贴到 1 个 Cell 里，点运行即可。（v2.2：双分类器 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL，带自检回退；自动爬取以【视频抽帧】为主并过滤登录墙；新增「生成 Excel」）",
       "import os",
       'APP_DIR = "/kaggle/working/app"',
       "os.makedirs(APP_DIR, exist_ok=True)",
       "_FILES = {",
-      `"server.py": r'''${server}''',`,
-      `"crawler.py": r'''${crawler}''',`,
-      `"index.html": r'''${index}''',`,
-      `"crawl.html": r'''${crawl}''',`,
+      ...APP_FILES.map((n) => `"${n}": r'''${src("kaggle/" + n)}''',`),
       "}",
       "for _n, _c in _FILES.items():",
       '    with open(f"{APP_DIR}/{_n}", "w", encoding="utf-8") as _f:',
@@ -117,10 +113,7 @@ export function buildGithubFiles(): CodeFile[] {
 
 /** Kaggle 里要用的所有 Cell */
 export function buildKaggleCells(): KaggleCell[] {
-  const server = src("kaggle/server.py");
-  const crawler = src("kaggle/crawler.py");
-  const index = src("kaggle/index.html");
-  const crawl = src("kaggle/crawl.html");
+  const w = (name: string) => `%%writefile /kaggle/working/app/${name}\n` + ensureNl(src("kaggle/" + name));
   return [
     {
       id: "one",
@@ -138,36 +131,18 @@ export function buildKaggleCells(): KaggleCell[] {
     {
       id: "c1",
       title: "分步 Cell 1：安装依赖",
-      desc: "只需运行一次。安装 transformers / NudeNet / RapidOCR / Playwright+Chromium 并自检 GPU 与浏览器。",
+      desc: "只需运行一次。安装 transformers / NudeNet / RapidOCR / Playwright+Chromium / yt-dlp / openpyxl，并自检 GPU、浏览器和 ffmpeg 抽帧。",
       content: ensureNl(src("kaggle/cell1_install.py")),
     },
+    { id: "c2", title: "分步 Cell 2：写入 server.py", desc: "整段粘贴到新 Cell（第一行 %%writefile 必须保留）。", content: w("server.py") },
+    { id: "c3", title: "分步 Cell 3：写入 crawler.py（爬取模块）", desc: "网络照片自动爬取（Playwright）+ 登录墙过滤。缺这个文件时只是没有爬取功能，审核照常。", content: w("crawler.py") },
+    { id: "c4", title: "分步 Cell 4：写入 videoframes.py（视频抽帧）", desc: "v2.2 新增：视频流解析（抖音/B站公开解析、yt-dlp、抓包）+ ffmpeg 抽帧。缺这个文件时爬取只能抓图片/截图。", content: w("videoframes.py") },
+    { id: "c5", title: "分步 Cell 5：写入 report.py（Excel 报告）", desc: "v2.2 新增：服务端「生成 Excel」（含缩略图 + 违规类别 + 汇总）。缺这个文件时只是服务端导出不可用。", content: w("report.py") },
+    { id: "c6", title: "分步 Cell 6：写入 index.html", desc: "Kaggle 自带网页版（公网网址直接打开就是它；有「自动爬取」和「生成 Excel」按钮）。", content: w("index.html") },
+    { id: "c7", title: "分步 Cell 7：写入 crawl.html（爬取界面）", desc: "Kaggle 自带的爬取页面，公网网址后面加 /crawl 即可打开（有「生成 Excel」按钮）。", content: w("crawl.html") },
     {
-      id: "c2",
-      title: "分步 Cell 2：写入 server.py",
-      desc: "整段粘贴到新 Cell（第一行 %%writefile 必须保留）。",
-      content: "%%writefile /kaggle/working/app/server.py\n" + ensureNl(server),
-    },
-    {
-      id: "c3",
-      title: "分步 Cell 3：写入 crawler.py（爬取模块）",
-      desc: "v2.1 新增：网络照片自动爬取 + 截图（Playwright）。缺这个文件时只是没有爬取功能，审核照常。",
-      content: "%%writefile /kaggle/working/app/crawler.py\n" + ensureNl(crawler),
-    },
-    {
-      id: "c4",
-      title: "分步 Cell 4：写入 index.html",
-      desc: "Kaggle 自带网页版（公网网址直接打开就是它；右上角有「自动爬取并审查网络照片」按钮）。",
-      content: "%%writefile /kaggle/working/app/index.html\n" + ensureNl(index),
-    },
-    {
-      id: "c5",
-      title: "分步 Cell 5：写入 crawl.html（爬取界面）",
-      desc: "Kaggle 自带的爬取页面，公网网址后面加 /crawl 即可打开。",
-      content: "%%writefile /kaggle/working/app/crawl.html\n" + ensureNl(crawl),
-    },
-    {
-      id: "c6",
-      title: "分步 Cell 6：启动服务 + 公网网址",
+      id: "c8",
+      title: "分步 Cell 8：启动服务 + 公网网址",
       desc: "每次重启 Notebook 都要运行；顶部注释里可切换 PROFILE（fast / balanced / max）。",
       content: ensureNl(src("kaggle/cell4_launch.py")),
     },

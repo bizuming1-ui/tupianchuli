@@ -1,206 +1,231 @@
-"use client";
-
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { buildGithubFiles, buildKaggleCells, compareWithRepo, makeZip, type CodeFile, type FileStatus, type RepoCompare } from "@/lib/codeFiles";
 import { copyText } from "@/lib/clipboard";
-import type { CodeFileInfo } from "@/lib/types";
+import { GH_BRANCH, GH_REPO_URL } from "@/lib/config";
 
-interface CodeData {
-  github: { files: CodeFileInfo[]; branch: string; remoteOk: boolean; repo: string };
-  kaggle: CodeFileInfo[];
-}
+type Tab = "github" | "kaggle";
 
-const BADGE: Record<CodeFileInfo["status"], { t: string; c: string }> = {
-  new: { t: "新增", c: "bg-emerald-500/20 text-emerald-300" },
-  changed: { t: "覆盖", c: "bg-amber-500/20 text-amber-300" },
-  same: { t: "无需修改", c: "bg-slate-600/40 text-slate-300" },
-  unknown: { t: "待确认", c: "bg-sky-500/20 text-sky-300" },
-  cell: { t: "", c: "bg-sky-500/20 text-sky-300" },
+const BADGE: Record<FileStatus, { text: string; cls: string }> = {
+  new: { text: "新增", cls: "bg-emerald-500/20 text-emerald-300" },
+  changed: { text: "覆盖", cls: "bg-amber-500/20 text-amber-300" },
+  same: { text: "无需修改", cls: "bg-slate-600/30 text-slate-400" },
+  unknown: { text: "未比对", cls: "bg-slate-600/30 text-slate-400" },
 };
 
-export default function CodeViewer() {
-  const [data, setData] = useState<CodeData | null>(null);
-  const [err, setErr] = useState("");
-  const [tab, setTab] = useState<"github" | "kaggle">("github");
-  const [sel, setSel] = useState<Record<string, number>>({ github: 0, kaggle: 0 });
-  const [flash, setFlash] = useState("");
-  const [loading, setLoading] = useState(false);
+function download(name: string, blob: Blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setErr("");
-    try {
-      const r = await fetch("/api/code", { cache: "no-store" });
-      const d = (await r.json()) as CodeData & { ok: boolean; error?: string };
-      if (!d.ok) throw new Error(d.error || "读取失败");
-      setData(d);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "读取失败");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+export default function CodeViewer({ initialTab = "github" }: { initialTab?: Tab }) {
+  const [tab, setTab] = useState<Tab>(initialTab);
+  const baseFiles = useMemo(() => buildGithubFiles(), []);
+  const cells = useMemo(() => buildKaggleCells(), []);
+  const [cmp, setCmp] = useState<RepoCompare | null>(null);
+  const [comparing, setComparing] = useState(false);
+  const [onlyChanged, setOnlyChanged] = useState(false);
+  const [selGh, setSelGh] = useState(baseFiles[0]?.path ?? "");
+  const [selKg, setSelKg] = useState("one");
+  const [flash, setFlash] = useState("");
+
+  const runCompare = useCallback(async () => {
+    setComparing(true);
+    setCmp(await compareWithRepo(baseFiles));
+    setComparing(false);
+  }, [baseFiles]);
 
   useEffect(() => {
-    const t = setTimeout(load, 0);
+    // 进入界面即自动与 GitHub 仓库比对
+    const t = setTimeout(() => void runCompare(), 0);
     return () => clearTimeout(t);
-  }, [load]);
+  }, [runCompare]);
 
-  const files = useMemo(() => (tab === "github" ? (data?.github.files ?? []) : (data?.kaggle ?? [])), [data, tab]);
-  const idx = Math.min(sel[tab] ?? 0, Math.max(0, files.length - 1));
-  const cur: CodeFileInfo | undefined = files[idx];
-  const repo = data?.github.repo ?? "bizuming1-ui/tupianchuli";
-  const branch = data?.github.branch ?? "main";
+  const files: CodeFile[] = useMemo(
+    () => baseFiles.map((f) => ({ ...f, status: cmp?.status[f.path] ?? "unknown" })),
+    [baseFiles, cmp],
+  );
+  const needUpdate = files.filter((f) => f.status === "new" || f.status === "changed");
+  const listed = onlyChanged && cmp && !cmp.error ? needUpdate : files;
+  const curGh = files.find((f) => f.path === selGh) ?? files[0];
+  const curKg = cells.find((c) => c.id === selKg) ?? cells[0];
 
-  const copy = async (key: string, text: string, label: string) => {
+  const doCopy = async (key: string, text: string) => {
     const ok = await copyText(text);
-    setFlash(ok ? `✓ 已复制：${label}` : "✗ 复制失败，请手动选中代码复制");
-    setTimeout(() => setFlash((f) => (f.includes(label) || f.startsWith("✗") ? "" : f)), 2200);
-    void key;
+    setFlash(ok ? key : "fail:" + key);
+    setTimeout(() => setFlash(""), 1800);
   };
+  const flashLabel = (key: string, label: string) => (flash === key ? "✓ 已复制" : flash === "fail:" + key ? "复制失败，请手动全选" : label);
 
-  const copyAll = () => {
-    if (!data) return;
-    if (tab === "kaggle") return copy("all", data.kaggle[0].content, "★ 一键运行 Cell");
-    const text = data.github.files.map((f) => `// ===== FILE: ${f.path} =====\n${f.content}`).join("\n\n");
-    return copy("all", text, `全部 ${data.github.files.length} 个文件（含文件名分隔）`);
-  };
+  const allText = (list: CodeFile[]) => list.map((f) => `\n// ===================== ${f.path} =====================\n${f.content}`).join("\n");
+  const editUrl = (f: CodeFile) =>
+    f.status === "new" ? `${GH_REPO_URL}/new/${GH_BRANCH}?filename=${encodeURIComponent(f.path)}` : `${GH_REPO_URL}/edit/${GH_BRANCH}/${f.path}`;
 
-  const ghLink = (f: CodeFileInfo) => {
-    const p = encodeURI(f.path);
-    return f.status === "changed" || f.status === "same"
-      ? `https://github.com/${repo}/edit/${branch}/${p}`
-      : `https://github.com/${repo}/new/${branch}?filename=${p}`;
-  };
+  const content = tab === "github" ? curGh?.content ?? "" : curKg?.content ?? "";
+  const gutter = useMemo(() => Array.from({ length: content.split("\n").length }, (_, i) => i + 1).join("\n"), [content]);
 
-  const counts = useMemo(() => {
-    const g = data?.github.files ?? [];
-    return {
-      new: g.filter((f) => f.status === "new" || f.status === "unknown").length,
-      changed: g.filter((f) => f.status === "changed").length,
-      same: g.filter((f) => f.status === "same").length,
-    };
-  }, [data]);
+  const btn = "rounded-lg px-3.5 py-2 text-sm font-semibold transition active:scale-95 whitespace-nowrap";
 
   return (
-    <div className="flex h-screen flex-col bg-[#060b18] text-slate-100">
+    <div className="flex h-full min-h-0 flex-col bg-[#050816] text-slate-200">
       {/* 标签页 */}
-      <div className="flex items-end gap-2 bg-[#03060f] px-3 pt-2">
+      <div className="flex shrink-0 gap-2 overflow-x-auto border-b border-slate-800 bg-[#02040d] px-3 pt-3">
         {(
           [
-            ["github", `① 更新到 GitHub 的代码（${data?.github.files.length ?? "…"}）`],
-            ["kaggle", `② 复制到 Kaggle 的代码（${data?.kaggle.length ?? "…"}）`],
-          ] as const
-        ).map(([k, t]) => (
+            ["github", `① 更新到 GitHub 的代码（${files.length}）`],
+            ["kaggle", `② 复制到 Kaggle 的代码（${cells.length}）`],
+          ] as [Tab, string][]
+        ).map(([k, label]) => (
           <button
             key={k}
             onClick={() => setTab(k)}
-            className={`rounded-t-xl px-5 py-3 text-sm font-bold sm:text-base ${tab === k ? "bg-[#0b1226] text-white" : "bg-[#0a1020] text-slate-500 hover:text-slate-300"}`}
+            className={`rounded-t-xl px-5 py-3 text-base font-bold whitespace-nowrap transition ${
+              tab === k ? "bg-[#0b1226] text-white ring-1 ring-slate-700" : "text-slate-500 hover:text-slate-300"
+            }`}
           >
-            {t}
+            {label}
           </button>
         ))}
-        <div className="flex-1" />
-        <button onClick={load} disabled={loading} className="mb-2 rounded-lg bg-slate-800 px-3 py-1.5 text-xs hover:bg-slate-700 disabled:opacity-50">
-          {loading ? "刷新中…" : "↻ 刷新（重新比对 GitHub）"}
-        </button>
       </div>
 
-      {/* 说明 */}
-      <div className="space-y-1 border-b border-slate-800 bg-[#0b1226] px-5 py-3 text-[13px] leading-relaxed text-slate-300">
+      {/* 操作说明 */}
+      <div className="shrink-0 space-y-1 border-b border-slate-800 bg-[#0a1020] px-4 py-3 text-[13px] leading-relaxed text-slate-300">
         {tab === "github" ? (
           <>
-            <p>
-              <b className="text-emerald-300">最快方式：</b>点左侧「下载全部 ZIP」→ 解压 → 打开{" "}
-              <a className="text-sky-300 underline" href={`https://github.com/${repo}/upload/${branch}`} target="_blank" rel="noreferrer">
-                仓库 Upload files 页面
-              </a>{" "}
-              → 把解压出的所有文件和文件夹一起拖进去 → Commit changes。
-            </p>
-            <p>1. 标「新增」的文件：点「在 GitHub 编辑」会打开已填好文件名的新建页，粘贴代码 → Commit。</p>
-            <p>2. 标「覆盖」的文件：点「在 GitHub 编辑」，全选粘贴 → Commit。标「无需修改」的跳过（已与仓库一致）。</p>
-            <p className="text-slate-400">
-              状态实时对比 {repo} 的 {branch} 分支：新增 {counts.new} · 覆盖 {counts.changed} · 无需修改 {counts.same}
-              {data && !data.github.remoteOk && "（当前无法访问 GitHub API，状态为待确认）"}
-            </p>
+            <p>1. 标“新增”的文件：在仓库点 Add file → Create new file，文件名填左侧路径，粘贴代码，Commit。</p>
+            <p>2. 标“覆盖”的文件：点右侧「在 GitHub 编辑」，全选后粘贴，Commit。标“无需修改”的跳过。</p>
+            <p>3. 懒人做法：点「下载 ZIP」解压后，在仓库页面 Add file → Upload files，把整个文件夹拖进去，Commit。</p>
+            <p>4. <b className="text-amber-300">kaggle/code1</b> 就是修复后的「一键运行 Cell」，务必覆盖，否则 GitHub 里仍是旧的报错版本。</p>
+            <p>5. 提交后 Settings → Pages → Source 选 GitHub Actions，1 分钟后网站自动更新。</p>
           </>
         ) : (
           <>
-            <p>0. 打开 kaggle.com → New Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 x2</b>，Internet 打开 <b>On</b>。</p>
-            <p>
-              1. 点左侧绿色按钮复制「★ 一键运行 Cell」→ 粘贴到 Notebook 的 <b>1 个代码 Cell</b> → 运行（首次下载模型约 3~8 分钟）。
-            </p>
-            <p>2. 输出里出现 https://xxxx.trycloudflare.com：这个网址本身就是完整网页版；也可粘贴到本网站「设置」里，用本站界面调用 GPU。</p>
-            <p className="text-slate-400">想分步执行/排查问题：依次运行 Cell 1 → 2 → 3 → 4。已推送 GitHub 后可用「方案B」替代 Cell 2+3。</p>
+            <p>1. 新建 Kaggle Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 x2</b>，Internet 选 <b>On</b>。</p>
+            <p>2. 复制下面的「★ 一键运行 Cell」，粘贴到 Notebook 的一个 Cell，点运行（首次下载模型约 3~8 分钟）。</p>
+            <p>3. 输出的 <b>https://xxxx.trycloudflare.com</b> 就是网址：直接打开即完整网页版；也可填到本站「设置」里连接 GPU。</p>
+            <p>4. 修复说明：两张 GPU 现在是<b>串行</b>加载（并行加载会触发 “Cannot copy out of meta tensor”），GPU0 好了就能用，GPU1 在后台继续。</p>
           </>
         )}
       </div>
 
-      {err && <div className="bg-red-900/40 px-5 py-2 text-sm text-red-200">读取代码失败：{err}</div>}
-
-      <div className="flex min-h-0 flex-1">
-        {/* 左侧文件列表 */}
-        <aside className="flex w-[300px] shrink-0 flex-col gap-2 overflow-hidden border-r border-slate-800 bg-[#080e1f] p-3 sm:w-[380px]">
-          <button onClick={copyAll} disabled={!data} className="rounded-xl bg-emerald-500 py-3 text-base font-bold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50">
-            {tab === "github" ? "复制本类全部代码" : "复制一键运行代码（推荐）"}
-          </button>
-          {tab === "github" && (
-            <a href="/api/code/zip" className="rounded-xl bg-sky-600 py-2.5 text-center text-sm font-bold hover:bg-sky-500">
-              ⬇ 下载全部 ZIP（拖进 GitHub 上传）
-            </a>
-          )}
-          <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
-            {files.map((f, i) => {
-              const b = BADGE[f.status];
-              return (
-                <button
-                  key={f.path}
-                  onClick={() => setSel((s) => ({ ...s, [tab]: i }))}
-                  className={`flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left font-mono text-[13px] ${i === idx ? "bg-slate-700/70" : "hover:bg-slate-800/70"}`}
-                >
-                  <span className="truncate" title={f.path}>
-                    {f.path}
-                  </span>
-                  <span className={`shrink-0 rounded-md px-2 py-0.5 font-sans text-xs ${b.c}`}>{f.status === "cell" ? f.badge : b.t}</span>
-                </button>
-              );
-            })}
-            {!data && !err && <p className="p-3 text-sm text-slate-500">正在读取源码…</p>}
-          </div>
-        </aside>
-
-        {/* 右侧查看器 */}
-        <section className="flex min-w-0 flex-1 flex-col">
-          {cur ? (
+      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[380px_1fr]">
+        {/* 左侧列表 */}
+        <aside className="flex min-h-0 max-h-[38vh] flex-col gap-2 overflow-hidden border-b border-slate-800 bg-[#070c1c] p-3 lg:max-h-none lg:border-b-0 lg:border-r">
+          {tab === "github" ? (
             <>
-              <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 bg-[#0b1226] px-4 py-3">
-                <h2 className="min-w-0 flex-1 truncate font-mono text-base font-bold">{cur.path}</h2>
-                <span className="text-sm text-slate-400">{cur.lines} 行</span>
-                <button onClick={() => copy("name", cur.path, "文件名")} className="rounded-lg bg-slate-700 px-3 py-2 text-sm font-semibold hover:bg-slate-600">
-                  复制文件名
+              <button
+                onClick={() => doCopy("all", allText(files))}
+                className={`${btn} bg-emerald-500 py-3 text-base text-emerald-950 hover:bg-emerald-400`}
+              >
+                {flashLabel("all", "复制本类全部代码")}
+              </button>
+              <div className="flex gap-2">
+                <button onClick={() => download("tupianchuli-code.zip", makeZip(files))} className={`${btn} flex-1 bg-slate-700/60 py-1.5 text-xs hover:bg-slate-600`}>
+                  ⬇ 下载 ZIP
                 </button>
-                {tab === "github" && (
-                  <a href={ghLink(cur)} target="_blank" rel="noreferrer" className="rounded-lg bg-slate-700 px-3 py-2 text-sm font-semibold hover:bg-slate-600">
-                    在 GitHub 编辑 ↗
-                  </a>
-                )}
-                <button onClick={() => copy("file", cur.content, cur.path)} className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-bold text-white hover:bg-sky-400">
-                  复制此文件
+                <button onClick={runCompare} disabled={comparing} className={`${btn} flex-1 bg-slate-700/60 py-1.5 text-xs hover:bg-slate-600 disabled:opacity-50`}>
+                  {comparing ? "比对中…" : "↻ 重新比对 GitHub"}
+                </button>
+                <button onClick={() => setOnlyChanged((v) => !v)} className={`${btn} flex-1 py-1.5 text-xs ${onlyChanged ? "bg-sky-600 text-white" : "bg-slate-700/60 hover:bg-slate-600"}`}>
+                  只看需更新
                 </button>
               </div>
-              <div className="flex min-h-0 flex-1 overflow-auto bg-[#050914] font-mono text-[13px] leading-6">
-                <pre className="select-none border-r border-slate-800 px-3 py-3 text-right text-slate-600">{Array.from({ length: cur.lines }, (_, i) => i + 1).join("\n")}</pre>
-                <pre className="flex-1 whitespace-pre px-4 py-3 text-slate-200">{cur.content}</pre>
+              <div className="text-xs text-slate-500">
+                {comparing
+                  ? "正在与 GitHub 仓库逐文件比对…"
+                  : cmp?.error
+                    ? `比对失败：${cmp.error}（仍可正常复制全部文件）`
+                    : `需更新 ${needUpdate.length} 个（新增 ${files.filter((f) => f.status === "new").length} / 覆盖 ${files.filter((f) => f.status === "changed").length}），无需修改 ${files.filter((f) => f.status === "same").length} 个`}
+              </div>
+              <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
+                {listed.map((f) => (
+                  <button
+                    key={f.path}
+                    onClick={() => setSelGh(f.path)}
+                    className={`flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left font-mono text-[13px] transition ${
+                      curGh?.path === f.path ? "bg-slate-700/70 text-white" : "text-slate-300 hover:bg-slate-800/70"
+                    }`}
+                  >
+                    <span className="truncate" title={f.path}>{f.path}</span>
+                    <span className={`shrink-0 rounded px-1.5 py-0.5 font-sans text-[11px] ${BADGE[f.status].cls}`}>{BADGE[f.status].text}</span>
+                  </button>
+                ))}
+                {cmp && cmp.obsolete.length > 0 && (
+                  <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-xs text-red-200">
+                    <div className="mb-1 font-semibold">仓库里有、但新版不再使用的旧文件（建议在 GitHub 删除，点文件名进入后点垃圾桶图标）：</div>
+                    <ul className="space-y-0.5 font-mono">
+                      {cmp.obsolete.map((p) => (
+                        <li key={p}>
+                          <a className="underline decoration-dotted hover:text-white" target="_blank" rel="noreferrer" href={`${GH_REPO_URL}/blob/${GH_BRANCH}/${p}`}>
+                            {p}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             </>
           ) : (
-            <div className="grid flex-1 place-items-center text-slate-500">{err || "加载中…"}</div>
+            <>
+              <button
+                onClick={() => doCopy("kone", cells[0].content)}
+                className={`${btn} bg-emerald-500 py-3 text-base text-emerald-950 hover:bg-emerald-400`}
+              >
+                {flashLabel("kone", "★ 复制「一键运行 Cell」")}
+              </button>
+              <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
+                {cells.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => setSelKg(c.id)}
+                    className={`block w-full rounded-lg px-3 py-2.5 text-left transition ${
+                      curKg?.id === c.id ? "bg-slate-700/70 text-white" : "text-slate-300 hover:bg-slate-800/70"
+                    }`}
+                  >
+                    <div className={`text-[13px] font-semibold ${c.star ? "text-emerald-300" : ""}`}>{c.title}</div>
+                    <div className="mt-0.5 text-[11px] leading-snug text-slate-500">{c.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </>
           )}
+        </aside>
+
+        {/* 右侧代码 */}
+        <section className="flex min-h-0 flex-col">
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-slate-800 bg-[#0a1020] px-4 py-3">
+            <div className="min-w-0 flex-1 truncate font-mono text-base font-bold text-white">
+              {tab === "github" ? curGh?.path : curKg?.title}
+            </div>
+            <span className="text-sm text-slate-500">{content.split("\n").length} 行</span>
+            {tab === "github" && curGh && (
+              <>
+                <button onClick={() => doCopy("name", curGh.path)} className={`${btn} bg-slate-700/60 hover:bg-slate-600`}>
+                  {flashLabel("name", "复制文件名")}
+                </button>
+                <a href={editUrl(curGh)} target="_blank" rel="noreferrer" className={`${btn} bg-slate-700/60 hover:bg-slate-600`}>
+                  在 GitHub {curGh.status === "new" ? "新建" : "编辑"} ↗
+                </a>
+              </>
+            )}
+            <button
+              onClick={() => doCopy("cur", content)}
+              className={`${btn} bg-sky-500 text-white hover:bg-sky-400`}
+            >
+              {flashLabel("cur", tab === "github" ? "复制此文件" : "复制此 Cell")}
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-auto bg-[#050816]">
+            <div className="flex min-w-max font-mono text-[13px] leading-6">
+              <pre className="sticky left-0 select-none bg-[#050816] px-3 text-right text-slate-600">{gutter}</pre>
+              <pre className="pr-6 text-slate-200">{content}</pre>
+            </div>
+          </div>
         </section>
       </div>
-
-      {flash && (
-        <div className="pointer-events-none fixed bottom-6 left-1/2 -translate-x-1/2 rounded-full bg-emerald-500 px-5 py-2 text-sm font-bold text-emerald-950 shadow-xl">{flash}</div>
-      )}
     </div>
   );
 }

@@ -15,8 +15,13 @@ export interface CrawlForm {
   platform: string;
   urlsText: string;
   keyword: string;
-  mode: "both" | "images" | "screenshot";
+  /** video=只要视频画面(默认) | all=视频+图片+截图 | both=图片+截图(旧) | images | screenshot */
+  mode: "video" | "all" | "both" | "images" | "screenshot";
   max_images: number;
+  /** 每个视频抽几帧 */
+  frames_per_video: number;
+  /** 最多处理几个视频 */
+  video_limit: number;
   scrolls: number;
   min_size: number;
   delay: number;
@@ -28,15 +33,15 @@ export interface CrawlForm {
 }
 
 export const DEFAULT_FORM: CrawlForm = {
-  platform: "xiaohongshu", urlsText: "", keyword: "", mode: "both", max_images: 60, scrolls: 8, min_size: 200,
-  delay: 0.8, deep: false, deep_limit: 12, mobile: false, cookie: "", analyze_mode: "full",
+  platform: "douyin", urlsText: "", keyword: "", mode: "video", max_images: 60, frames_per_video: 6, video_limit: 10, scrolls: 8, min_size: 200,
+  delay: 0.8, deep: true, deep_limit: 12, mobile: false, cookie: "", analyze_mode: "full",
 };
 
 export type CrawlItemStatus = "queued" | "running" | "done" | "error" | "skipped";
 
 export interface CrawlItem {
   idx: number;
-  kind: "image" | "screenshot";
+  kind: "image" | "screenshot" | "frame" | "cover";
   src: string;
   page: string;
   w: number;
@@ -49,6 +54,13 @@ export interface CrawlItem {
   rev: number;
   t: number;
   ms?: number;
+  /** v2.2：被识别为登录/验证码墙截图（已排除出统计与 Excel） */
+  wall?: boolean;
+  /** v2.2：视频帧所属视频编号 / 时间点(秒) / 标题 / 视频地址 */
+  vid?: number;
+  ts?: number;
+  title?: string;
+  video?: string;
 }
 
 export type CrawlState = "queued" | "running" | "done" | "stopped" | "error";
@@ -60,11 +72,14 @@ export interface CrawlView {
   engine: string;
   rev: number;
   elapsed: number;
-  stats: { pages: number; found: number; screenshots: number; analyzed: number; errors: number; dup: number; small: number; pass: number; review: number; block: number };
+  stats: { pages: number; found: number; screenshots: number; analyzed: number; errors: number; dup: number; small: number; pass: number; review: number; block: number;
+    frames?: number; videos?: number; video_fail?: number; walls?: number; wall_pages?: number; wall_skip?: number; ui?: number };
   pending: number;
   conc: number;
   gpu_count: Record<string, number>;
   cap_hit: boolean;
+  video_cap_hit?: boolean;
+  params?: { urls?: string[]; mode?: string; platform?: string };
   logs: string[];
   total: number;
   items: CrawlItem[];
@@ -83,6 +98,7 @@ export async function startCrawl(base: string, f: CrawlForm): Promise<{ id: stri
   const body = {
     urls: f.urlsText.split(/\n+/).map((s) => s.trim()).filter(Boolean),
     platform: f.platform, keyword: f.keyword.trim(), mode: f.mode, max_images: f.max_images, scrolls: f.scrolls,
+    frames_per_video: f.frames_per_video, video_limit: f.video_limit,
     min_size: f.min_size, delay: f.delay, deep: f.deep, deep_limit: f.deep_limit, mobile: f.mobile, cookie: f.cookie.trim(),
     analyze_mode: f.analyze_mode,
   };

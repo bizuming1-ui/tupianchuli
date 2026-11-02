@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { analyzeDemo, analyzeRemote, askRemote, fetchHealth, normalizeApiUrl, prepareImage } from "@/lib/analyzer";
 import { copyText } from "@/lib/clipboard";
+import { buildExcel, downloadBlob, type ExcelRow } from "@/lib/excel";
 import type { AnalysisResult, HealthInfo, ScanItem, Verdict } from "@/lib/types";
 import { GpuPanel, ImageOverlay, InsightPanel } from "./Insights";
 
@@ -400,6 +401,21 @@ export default function ModerationApp({ compact = false, onOpenCrawl }: { compac
     }
     download(`审查结果-${new Date().toISOString().slice(0, 10)}.csv`, "\ufeff" + rows.join("\n"), "text/csv;charset=utf-8");
   };
+  const [xlsxBusy, setXlsxBusy] = useState(false);
+  /** 生成 Excel：每张图一行（缩略图嵌入）+ 结论 + 违规类别（涉政/涉黄/暴力…）+ 原因 + 汇总。纯浏览器生成，演示模式也能用 */
+  const exportExcel = async () => {
+    const done = items.filter((i) => i.res || i.status === "error");
+    if (!done.length) return;
+    setXlsxBusy(true);
+    try {
+      const rows: ExcelRow[] = done.map((it, n) => ({ idx: n + 1, kind: "upload", name: it.name, res: it.res ?? null, err: it.err, image: it.file }));
+      const blob = await buildExcel(rows, { title: "图片智能审查报告" });
+      downloadBlob(`图片审核报告-${new Date().toISOString().slice(0, 10)}.xlsx`, blob);
+    } catch (e) {
+      alert(e instanceof Error ? `生成 Excel 失败：${e.message}` : "生成 Excel 失败");
+    }
+    setXlsxBusy(false);
+  };
   const exportJson = () =>
     download("审查结果.json", JSON.stringify(items.map((i) => ({ name: i.name, status: i.status, error: i.err, result: i.res })), null, 2), "application/json");
 
@@ -469,6 +485,7 @@ export default function ModerationApp({ compact = false, onOpenCrawl }: { compac
             <button onClick={() => setSettingsOpen(true)} className={`rounded-full px-3 py-1.5 text-xs font-medium ring-1 ${pill.cls}`}>{pill.text}</button>
             <button onClick={() => { setHistory(loadHistory()); setHistoryOpen(true); }} className={btn}>🕘 历史</button>
             <button onClick={() => setSettingsOpen(true)} className={btn}>⚙️ 设置</button>
+            <button onClick={exportExcel} disabled={xlsxBusy || !items.some((i) => i.res || i.status === "error")} title="把当前所有审核结果生成 Excel（含图片、涉政/涉黄等类别）" className="rounded-lg bg-green-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-lg shadow-green-900/40 transition hover:bg-green-500 active:scale-95 disabled:opacity-40">{xlsxBusy ? "生成中…" : "📊 生成 Excel"}</button>
             {onOpenCrawl && (
               <button onClick={onOpenCrawl} title="在抖音 / 小红书等平台自动爬取或截图，并交给 Kaggle T4×2 精准审核" className="rounded-lg bg-emerald-500 px-3.5 py-1.5 text-xs font-bold text-emerald-950 shadow-lg shadow-emerald-900/40 transition hover:bg-emerald-400 active:scale-95">🕸️ 自动爬取并审查网络照片</button>
             )}
@@ -513,6 +530,7 @@ export default function ModerationApp({ compact = false, onOpenCrawl }: { compac
                   <button onClick={() => setPaused((p) => !p)} className={btn} disabled={!active}>{paused ? "▶ 继续" : "⏸ 暂停"}</button>
                   <button onClick={() => requeue((i) => i.status === "error")} className={btn} disabled={!stats.error}>🔁 重试失败</button>
                   {stats.demo > 0 && conn === "online" && <button onClick={() => requeue((i) => i.res?.engine === "demo")} className={`${btn} !bg-sky-600 !text-white`}>🤖 用 AI 重审演示结果（{stats.demo}）</button>}
+                  <button onClick={exportExcel} disabled={xlsxBusy} className="rounded-lg bg-green-600 px-3 py-1.5 text-xs font-bold text-white shadow-lg shadow-green-900/40 transition hover:bg-green-500 active:scale-95 disabled:opacity-40" title="生成 Excel：含缩略图、涉政/涉黄/暴力等违规类别、汇总">{xlsxBusy ? "生成中…" : "📊 生成 Excel"}</button>
                   <button onClick={exportCsv} className={btn}>⬇ 导出 CSV</button>
                   <button onClick={exportJson} className={btn}>⬇ 导出 JSON</button>
                   <button onClick={() => setSortRisk((v) => !v)} className={`${btn} ${sortRisk ? "!bg-sky-600 !text-white" : ""}`}>风险优先排序</button>
@@ -549,7 +567,7 @@ export default function ModerationApp({ compact = false, onOpenCrawl }: { compac
               {[
                 ["① 连接 GPU", "在「设置」填入 Kaggle 输出的 trycloudflare 网址，即可使用 T4×2 + 大模型精准审查。"],
                 ["② 拖入图片", "数量不限，文件夹也行。边压缩边上传，GPU 空闲副本抢占处理，界面不卡顿。"],
-                ["③ 看结果", "每张图给出 通过 / 待复核 / 拦截 + 一句中文描述 + 判定原因，可导出 CSV。"],
+                ["③ 看结果", "每张图给出 通过 / 待复核 / 拦截 + 一句中文描述 + 判定原因，可导出 CSV / 生成 Excel（含图片和违规类别）。"],
               ].map(([t, d]) => (
                 <div key={t} className="rounded-xl border border-slate-800 bg-slate-900/50 p-4"><div className="mb-1 font-semibold text-slate-200">{t}</div>{d}</div>
               ))}

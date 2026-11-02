@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { analyzeDemo, analyzeRemote, askRemote, fetchHealth, normalizeApiUrl, prepareImage } from "@/lib/analyzer";
 import { copyText } from "@/lib/clipboard";
 import type { AnalysisResult, HealthInfo, ScanItem, Verdict } from "@/lib/types";
+import { GpuPanel, ImageOverlay, InsightPanel } from "./Insights";
 
 type Kind = Verdict | "queued" | "error";
 type Filter = "all" | Kind;
@@ -88,6 +89,10 @@ const Card = memo(
               <p className="line-clamp-2 min-h-[2.5em] text-[13px] leading-snug text-slate-200">{res.description}</p>
               <Bar label="涉黄" value={res.porn.score} />
               <Bar label="涉政" value={res.political.score} />
+              {res.violence && res.violence.score >= 0.25 && <Bar label="暴力" value={res.violence.score} />}
+              {(res.detections ?? []).some((d) => d.flag) && (
+                <div className="text-[11px] text-red-300">⚑ 命中 {(res.detections ?? []).filter((d) => d.flag).length} 处风险区域</div>
+              )}
             </>
           )}
           {it.err && <p className="text-xs text-red-300">{it.err}</p>}
@@ -571,14 +576,15 @@ export default function ModerationApp({ compact = false }: { compact?: boolean }
             {health && (
               <div className="mt-2 space-y-0.5 text-xs text-slate-400">
                 <div>副本 {health.replicas_ready}/{health.replicas} · 已处理 {health.processed} 张 · 平均 {health.avg_ms}ms/张</div>
-                <div>模型：{health.models.nsfw} / {health.models.clip}{health.models.vlm ? ` / ${health.models.vlm}` : "（大模型未加载）"}</div>
+                <div>模型：{health.models.nsfw} / {health.models.clip}{health.models.vlm ? ` / ${health.models.vlm}` : "（大模型未加载）"}{health.version ? ` · 服务 v${health.version}` : ""}</div>
+                <GpuPanel health={health} />
                 {(health.warnings || []).map((w) => <div key={w} className="text-amber-300">⚠️ {w}</div>)}
               </div>
             )}
             {conn === "offline" && <p className="mt-2 text-xs text-red-300">无法连接：请确认 Kaggle Notebook 的启动 Cell 仍在运行，并且网址是最新的（每次重启都会变）。</p>}
             <div className="mt-4 text-xs font-semibold text-slate-300">审查模式</div>
             <div className="mt-1 grid grid-cols-2 gap-2">
-              {([["full", "完整（推荐）", "分类器 + CLIP + 大模型：描述最准、涉政判断更可靠"], ["fast", "快速", "仅分类器 + CLIP：速度最快，描述较简单"]] as const).map(([k, t, d]) => (
+              {([["full", "完整（推荐）", "双分类器 + CLIP + 分块 + NudeNet + 目标检测 + OCR + 大模型：最准、最全"], ["fast", "快速", "分类器 + CLIP + 分块 + NudeNet：速度最快，仍覆盖全图各区域"]] as const).map(([k, t, d]) => (
                 <button key={k} onClick={() => { setMode(k); localStorage.setItem("mod.mode", k); }} className={`rounded-lg p-3 text-left text-xs ring-1 ${mode === k ? "bg-sky-500/15 ring-sky-400" : "bg-slate-800 ring-slate-700"}`}>
                   <div className="font-bold text-white">{t}</div><div className="mt-0.5 text-slate-400">{d}</div>
                 </button>
@@ -663,7 +669,7 @@ function Detail({ it, list, online, api, onClose, onGo }: { it: ScanItem; list: 
     <div className="absolute inset-0 z-40 flex items-stretch justify-center bg-black/75 p-2 sm:p-4" onClick={onClose}>
       <div className="relative flex w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl md:flex-row" onClick={(e) => e.stopPropagation()}>
         <div className="relative grid min-h-[200px] flex-1 place-items-center bg-black">
-          {url && <img src={url} alt={it.name} className="max-h-full max-w-full object-contain" />}
+          {url && <ImageOverlay url={url} name={it.name} res={res} />}
           {idx > 0 && <button onClick={() => onGo(list[idx - 1].id)} className="absolute left-2 top-1/2 -translate-y-1/2 rounded-full bg-black/60 px-3 py-2 text-xl text-white hover:bg-black">‹</button>}
           {idx >= 0 && idx < list.length - 1 && <button onClick={() => onGo(list[idx + 1].id)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-black/60 px-3 py-2 text-xl text-white hover:bg-black">›</button>}
         </div>
@@ -680,8 +686,10 @@ function Detail({ it, list, online, api, onClose, onGo }: { it: ScanItem; list: 
               <div className="space-y-1.5 rounded-lg bg-slate-800/50 p-3">
                 <Bar label="涉黄" value={res.porn.score} />
                 <Bar label="涉政" value={res.political.score} />
+                {res.violence && <Bar label="暴力" value={res.violence.score} />}
                 <div className="pt-1 text-[11px] text-slate-400">涉黄等级：{res.porn.level} · 涉政等级：{res.political.level}{res.political.labels?.length ? `（${res.political.labels.join("、")}）` : ""}</div>
               </div>
+              <InsightPanel res={res} />
               {res.ocr_text && <div className="rounded-lg bg-slate-800/50 p-3 text-xs text-slate-300"><div className="mb-1 font-semibold text-slate-400">图中文字</div>{res.ocr_text}</div>}
               <div className="text-[11px] leading-relaxed text-slate-500">
                 引擎：{res.engine}{res.gpu ? ` · ${res.gpu}` : ""}{res.cached ? " · 缓存命中" : ""}

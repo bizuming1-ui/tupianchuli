@@ -41,6 +41,7 @@ const RAW = import.meta.glob(
     "/index.html",
     "/.github/workflows/*.yml",
     "/kaggle/*",
+    "!/kaggle/code1", // code1 由 buildOneClickCell() 合成，不重复打包进前端
     "/src/**/*.{ts,tsx,css}",
   ],
   { query: "?raw", import: "default", eager: true },
@@ -54,7 +55,7 @@ const src = (p: string): string => RAW["/" + p] ?? "";
 const ROOT_ORDER = [
   "README.md", ".gitignore", "package.json", "tsconfig.json", "vite.config.ts", "index.html",
   ".github/workflows/deploy.yml",
-  "kaggle/server.py", "kaggle/index.html", "kaggle/requirements.txt", "kaggle/cell1_install.py",
+  "kaggle/server.py", "kaggle/crawler.py", "kaggle/index.html", "kaggle/crawl.html", "kaggle/requirements.txt", "kaggle/cell1_install.py",
   "kaggle/cell4_launch.py", "kaggle/cell_alt_git_clone.py", "kaggle/code1",
 ];
 
@@ -63,23 +64,27 @@ const ensureNl = (t: string) => (t.endsWith("\n") ? t : t + "\n");
 /** 合成「一键运行 Cell」：把 server.py / index.html 以 Python 原始字符串写入磁盘，再安装依赖、启动服务 */
 export function buildOneClickCell(): string {
   const server = src("kaggle/server.py");
+  const crawler = src("kaggle/crawler.py");
   const index = src("kaggle/index.html");
+  const crawl = src("kaggle/crawl.html");
   const cell1 = src("kaggle/cell1_install.py");
   const cell4 = src("kaggle/cell4_launch.py");
-  if (server.includes("'''") || index.includes("'''")) {
-    throw new Error("server.py / index.html 含有三个连续单引号，无法内嵌为 Python 原始字符串");
+  for (const t of [server, crawler, index, crawl]) {
+    if (t.includes("'''")) throw new Error("server.py / crawler.py / index.html / crawl.html 含有三个连续单引号，无法内嵌为 Python 原始字符串");
   }
   return ensureNl(
     [
       "# ===== ★ 一键运行（推荐）：写入文件 → 安装依赖 → 启动 GPU 服务 → 生成公网网址 =====",
       "# 前置：Notebook 右侧 Settings → Accelerator 选 GPU T4 x2；Internet 打开 On",
-      "# 只需要把这一整段粘贴到 1 个 Cell 里，点运行即可。（v2.0：双分类器 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL，带自检回退）",
+      "# 只需要把这一整段粘贴到 1 个 Cell 里，点运行即可。（v2.1：双分类器 + CLIP + NudeNet + OWLv2 + OCR + Qwen2.5-VL，带自检回退；新增 自动爬取并审查网络照片）",
       "import os",
       'APP_DIR = "/kaggle/working/app"',
       "os.makedirs(APP_DIR, exist_ok=True)",
       "_FILES = {",
       `"server.py": r'''${server}''',`,
+      `"crawler.py": r'''${crawler}''',`,
       `"index.html": r'''${index}''',`,
+      `"crawl.html": r'''${crawl}''',`,
       "}",
       "for _n, _c in _FILES.items():",
       '    with open(f"{APP_DIR}/{_n}", "w", encoding="utf-8") as _f:',
@@ -113,7 +118,9 @@ export function buildGithubFiles(): CodeFile[] {
 /** Kaggle 里要用的所有 Cell */
 export function buildKaggleCells(): KaggleCell[] {
   const server = src("kaggle/server.py");
+  const crawler = src("kaggle/crawler.py");
   const index = src("kaggle/index.html");
+  const crawl = src("kaggle/crawl.html");
   return [
     {
       id: "one",
@@ -131,7 +138,7 @@ export function buildKaggleCells(): KaggleCell[] {
     {
       id: "c1",
       title: "分步 Cell 1：安装依赖",
-      desc: "只需运行一次。安装 transformers / NudeNet / RapidOCR 并自检 GPU。",
+      desc: "只需运行一次。安装 transformers / NudeNet / RapidOCR / Playwright+Chromium 并自检 GPU 与浏览器。",
       content: ensureNl(src("kaggle/cell1_install.py")),
     },
     {
@@ -142,13 +149,25 @@ export function buildKaggleCells(): KaggleCell[] {
     },
     {
       id: "c3",
-      title: "分步 Cell 3：写入 index.html",
-      desc: "Kaggle 自带网页版（公网网址直接打开就是它）。",
-      content: "%%writefile /kaggle/working/app/index.html\n" + ensureNl(index),
+      title: "分步 Cell 3：写入 crawler.py（爬取模块）",
+      desc: "v2.1 新增：网络照片自动爬取 + 截图（Playwright）。缺这个文件时只是没有爬取功能，审核照常。",
+      content: "%%writefile /kaggle/working/app/crawler.py\n" + ensureNl(crawler),
     },
     {
       id: "c4",
-      title: "分步 Cell 4：启动服务 + 公网网址",
+      title: "分步 Cell 4：写入 index.html",
+      desc: "Kaggle 自带网页版（公网网址直接打开就是它；右上角有「自动爬取并审查网络照片」按钮）。",
+      content: "%%writefile /kaggle/working/app/index.html\n" + ensureNl(index),
+    },
+    {
+      id: "c5",
+      title: "分步 Cell 5：写入 crawl.html（爬取界面）",
+      desc: "Kaggle 自带的爬取页面，公网网址后面加 /crawl 即可打开。",
+      content: "%%writefile /kaggle/working/app/crawl.html\n" + ensureNl(crawl),
+    },
+    {
+      id: "c6",
+      title: "分步 Cell 6：启动服务 + 公网网址",
       desc: "每次重启 Notebook 都要运行；顶部注释里可切换 PROFILE（fast / balanced / max）。",
       content: ensureNl(src("kaggle/cell4_launch.py")),
     },

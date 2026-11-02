@@ -38,6 +38,8 @@ export interface HealthInfo {
   processed: number;
   avg_ms: number;
   error: string | null;
+  warnings?: string[];
+  loading_done?: boolean;
 }
 
 export type ItemStatus = "queued" | "running" | "done" | "error";
@@ -54,13 +56,4 @@ export interface ScanItem {
   rev: number;
   saved?: boolean;
   elapsedMs?: number;
-}
-
-export interface CodeFileInfo {
-  path: string;
-  label?: string;
-  content: string;
-  lines: number;
-  status: "new" | "changed" | "same" | "unknown" | "cell";
-  badge?: string;
 }

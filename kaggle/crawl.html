@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>自动爬取并审查网络照片 · Kaggle GPU</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b1020;color:#e5e9f5;font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:12px 18px;background:#070b17;border-bottom:1px solid #1d2744;position:sticky;top:0;z-index:5;flex-wrap:wrap}
+h1{font-size:16px;margin:0}.pill{padding:3px 10px;border-radius:99px;background:#1d2744;font-size:12px}.ok{background:#064e3b;color:#6ee7b7}.bad{background:#7f1d1d;color:#fca5a5}.warn{background:#78350f;color:#fcd34d}
+main{padding:18px;max-width:1400px;margin:auto}
+a.back{color:#7dd3fc;text-decoration:none;font-size:13px;margin-left:auto}
+.panel{background:#0f1730;border:1px solid #1d2744;border-radius:12px;padding:14px;margin-bottom:14px}
+textarea,input,select{background:#070b17;color:#e5e9f5;border:1px solid #2c3a66;border-radius:8px;padding:7px 10px;font-size:13px;width:100%}
+textarea{min-height:90px;font-family:ui-monospace,Consolas,monospace}
+label{font-size:12px;color:#93a0c8;display:block;margin-bottom:3px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:10px}
+button{background:#1d2744;color:#e5e9f5;border:1px solid #2c3a66;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
+button.pri{background:#10b981;border-color:#10b981;color:#052e1f;font-weight:700}button.stop{background:#dc2626;border-color:#dc2626;color:#fff}button:disabled{opacity:.4}
+.gp{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}.g{background:#070b17;border:1px solid #1d2744;border-radius:8px;padding:6px 10px;font-size:12px;min-width:210px}
+.bar{height:6px;background:#1d2744;border-radius:9px;overflow:hidden;margin:6px 0}.bar>i{display:block;height:100%;background:linear-gradient(90deg,#0ea5e9,#22c55e);transition:width .3s}
+#log{background:#050813;border-radius:8px;padding:8px 10px;font:12px/1.6 ui-monospace,Consolas,monospace;color:#9fb0e0;max-height:150px;overflow:auto;white-space:pre-wrap}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
+.card{background:#0f1730;border:1px solid #1d2744;border-radius:12px;overflow:hidden}
+.card img{width:100%;height:180px;object-fit:contain;background:#050813;display:block;cursor:zoom-in}
+.card .b{padding:8px 10px;font-size:12px}.tag{display:inline-block;padding:1px 8px;border-radius:6px;font-weight:600}
+.pass{background:#064e3b;color:#6ee7b7}.review{background:#78350f;color:#fcd34d}.block{background:#7f1d1d;color:#fca5a5}.pending{background:#1d2744;color:#93a0c8}
+.d{color:#aab4d4;margin-top:4px;word-break:break-all}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.tabs button.on{background:#0ea5e9;border-color:#0ea5e9;color:#fff}
+.note{font-size:11.5px;color:#fcd34d;margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🕸️ 自动爬取并审查网络照片</h1>
+  <span id="st" class="pill">连接中…</span><span id="eng" class="pill"></span>
+  <a class="back" href="/">← 返回图片审查</a>
+</header>
+<main>
+  <div class="panel">
+    <label>网址 / 分享链接（每行一个；可直接粘贴「复制打开抖音…」「小红书分享文案」整段文字，会自动提取链接）</label>
+    <textarea id="urls" placeholder="https://www.xiaohongshu.com/explore/...&#10;https://v.douyin.com/xxxx/&#10;https://image.baidu.com/search/index?tn=baiduimage&word=风景"></textarea>
+    <div class="row">
+      <div><label>或：平台搜索</label><select id="platform"><option value="xiaohongshu">小红书</option><option value="douyin">抖音</option><option value="weibo">微博</option><option value="bilibili">哔哩哔哩</option><option value="baidu">百度图片</option><option value="bing">必应图片</option><option value="custom">仅用上面的网址</option></select></div>
+      <div><label>搜索关键词（可空）</label><input id="kw" placeholder="例如：穿搭"></div>
+      <div><label>采集方式</label><select id="mode"><option value="both">图片 + 截图（最全）</option><option value="images">只抓图片</option><option value="screenshot">只截图</option></select></div>
+      <div><label>最多张数</label><input id="max" type="number" value="60" min="1" max="600"></div>
+      <div><label>滚动屏数</label><input id="scrolls" type="number" value="8" min="0" max="60"></div>
+      <div><label>最小边长(px)</label><input id="min" type="number" value="200"></div>
+      <div><label>审核模式</label><select id="amode"><option value="full">完整（大模型描述，最准）</option><option value="fast">快速（仅分类器）</option></select></div>
+    </div>
+    <div class="row">
+      <div><label><input id="deep" type="checkbox" style="width:auto"> 深入作品详情（逐个打开作品页）</label></div>
+      <div><label><input id="mobile" type="checkbox" style="width:auto"> 手机端页面（竖屏截图）</label></div>
+    </div>
+    <div style="margin-top:10px"><label>Cookie（可选：你自己账号的登录态，只在内存中使用、不保存；系统不会绕过登录/验证码）</label><input id="cookie" placeholder="a=1; b=2"></div>
+    <div style="margin-top:12px;display:flex;gap:8px"><button class="pri" id="go">▶ 开始爬取并审核</button><button class="stop" id="stop" disabled>■ 停止</button><button id="csv">导出 CSV</button></div>
+    <div class="note">合规提示：仅用于内容审核 / 自有或已获授权的内容，并遵守目标平台服务条款。遇到登录或验证码页面时只会提示，不会绕过。</div>
+  </div>
+  <div class="panel">
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b id="state">未开始</b><span id="stats"></span></div>
+    <div class="bar"><i id="pg" style="width:0"></i></div>
+    <div class="gp" id="gp"></div>
+    <div id="log"></div>
+  </div>
+  <div class="tabs" id="tabs"></div>
+  <div id="grid"></div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const VT={pass:"✅ 通过",review:"⚠️ 待复核",block:"🚫 拦截"};
+let job=null,since=0,items=new Map(),filter="all",timer=null;
+async function health(){try{const h=await (await fetch("/api/health")).json();
+ $("#st").textContent=h.ready?"GPU 就绪 · "+h.replicas_ready+" 副本":"模型加载中…";$("#st").className="pill "+(h.ready?"ok":"warn");
+ const c=h.crawler||{};$("#eng").textContent="爬取引擎："+(c.chromium?"Chromium 浏览器":"HTTP 降级（建议运行 Cell 1 安装 Chromium）");$("#eng").className="pill "+(c.chromium?"ok":"warn");
+ }catch(e){$("#st").textContent="未连接";$("#st").className="pill bad"}}
+setInterval(health,5000);health();
+function body(){return{urls:$("#urls").value.split(/\n/).filter(x=>x.trim()),platform:$("#platform").value,keyword:$("#kw").value,mode:$("#mode").value,
+ max_images:+$("#max").value,scrolls:+$("#scrolls").value,min_size:+$("#min").value,analyze_mode:$("#amode").value,deep:$("#deep").checked,mobile:$("#mobile").checked,cookie:$("#cookie").value}}
+$("#go").onclick=async()=>{
+ const r=await fetch("/api/crawl/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body())});
+ const j=await r.json();if(!r.ok){alert(j.detail||"启动失败");return}
+ job=j.id;since=0;items=new Map();render();$("#go").disabled=true;$("#stop").disabled=false;poll()};
+$("#stop").onclick=()=>job&&fetch("/api/crawl/"+job+"/stop",{method:"POST"});
+async function poll(){clearTimeout(timer);if(!job)return;
+ try{const j=await (await fetch("/api/crawl/"+job+"?since="+since)).json();since=j.rev;for(const it of j.items)items.set(it.idx,it);
+  const s=j.stats,fin=s.analyzed+s.errors,tot=Math.max(1,j.total);
+  $("#state").textContent=({queued:"排队中",running:"⏳ 爬取并审核中…",done:"✅ 已完成",stopped:"■ 已停止",error:"❌ 出错"})[j.state]+"  "+j.elapsed+"s";
+  $("#stats").textContent="抓到图片 "+s.found+" · 截图 "+s.screenshots+" · 已审核 "+s.analyzed+" · 拦截 "+s.block+" · 待复核 "+s.review+" · 通过 "+s.pass+" · 重复/过小 "+(s.dup+s.small);
+  $("#pg").style.width=Math.round(fin/tot*100)+"%";
+  $("#gp").innerHTML=(j.gpu_stats||[]).map(g=>'<div class="g"><b>GPU'+g.index+'</b> '+(g.busy?"● 工作中":g.ready?"○ 空闲":"◌ 加载中")+(g.mem_used_gb!=null?" · "+g.mem_used_gb+"/"+g.mem_total_gb+"G":"")+" · 已处理 "+g.processed+"</div>").join("");
+  $("#log").textContent=j.logs.join("\n");$("#log").scrollTop=1e9;render();
+  if(["done","stopped","error"].includes(j.state)){$("#go").disabled=false;$("#stop").disabled=true;return}
+ }catch(e){}
+ timer=setTimeout(poll,1000)}
+function render(){const arr=[...items.values()];const cnt=k=>arr.filter(i=>k==="all"||(i.res?i.res.verdict===k:k==="pending"&&i.status!=="error")).length;
+ $("#tabs").innerHTML=[["all","全部"],["block","🚫 拦截"],["review","⚠️ 待复核"],["pass","✅ 通过"],["pending","⏳ 处理中"]].map(([k,t])=>'<button data-k="'+k+'" class="'+(filter===k?"on":"")+'">'+t+" "+cnt(k)+"</button>").join("");
+ $("#tabs").querySelectorAll("button").forEach(b=>b.onclick=()=>{filter=b.dataset.k;render()});
+ const list=arr.filter(i=>filter==="all"||(i.res?i.res.verdict===filter:filter==="pending"&&i.status!=="error")).sort((a,b)=>{const w=i=>i.res?({block:3,review:2,pass:1})[i.res.verdict]:0;return w(b)-w(a)||a.idx-b.idx});
+ $("#grid").innerHTML=list.map(i=>{const v=i.res?i.res.verdict:"pending";const base="/api/crawl/"+job+"/";
+  return '<div class="card"><a href="'+base+'img/'+i.idx+'" target="_blank"><img loading="lazy" src="'+base+'thumb/'+i.idx+'"></a><div class="b"><span class="tag '+v+'">'+(VT[v]||(i.status==="error"?"❌ 失败":"⏳ 审核中"))+"</span> "+(i.kind==="screenshot"?"📸":"🖼️")+" "+i.w+"×"+i.h+
+  '<div class="d">'+(i.res?esc(i.res.description||""):esc(i.err||""))+"</div>"+(i.res&&i.res.reasons&&i.res.reasons.length?'<div class="d" style="color:#fcd34d">'+i.res.reasons.map(esc).join("；")+"</div>":"")+
+  '<div class="d"><a style="color:#7dd3fc" target="_blank" href="'+esc(i.page)+'">来源页</a></div></div></div>'}).join("")}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c])}
+$("#csv").onclick=()=>{const q=v=>'"'+String(v==null?"":v).replace(/"/g,'""')+'"';const rows=[["序号","类型","结论","描述","原因","图片地址","来源页"].map(q).join(",")];
+ for(const i of items.values())rows.push([i.idx,i.kind,i.res?i.res.verdict:i.status,i.res?i.res.description:i.err,i.res?(i.res.reasons||[]).join("；"):"",i.src,i.page].map(q).join(","));
+ const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["\ufeff"+rows.join("\n")],{type:"text/csv"}));a.download="爬取审核结果.csv";a.click()};
+</script>
+</body>
+</html>

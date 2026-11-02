@@ -1,0 +1,8 @@
+transformers>=4.49,<5
+accelerate
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+pyngrok
+# torch 使用 Kaggle 自带版本，不要重装

@@ -12,3 +12,6 @@ nudenet
 rapidocr_onnxruntime
 # opencv：Kaggle 自带 opencv-python；本地环境请 pip install opencv-python-headless
 # torch 使用 Kaggle 自带版本，不要重装
+# --- v2.1 网络照片自动爬取（可选，缺失时降级为 HTTP 模式）---
+playwright
+# 安装后还需要：python -m playwright install chromium && python -m playwright install-deps chromium

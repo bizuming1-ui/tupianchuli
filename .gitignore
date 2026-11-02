@@ -1,10 +1,6 @@
 node_modules
-.next
-out
-.env
-.env.local
-*.log
-next-env.d.ts
-tsconfig.tsbuildinfo
-__pycache__
+dist
 .DS_Store
+*.log
+__pycache__
+.env

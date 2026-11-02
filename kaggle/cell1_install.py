@@ -12,7 +12,7 @@ def sh(cmd):
     return p.returncode
 
 # 不重装 torch（Kaggle 自带与 CUDA 匹配的版本），只升级需要的库。Qwen2-VL 需要 transformers>=4.45
-sh(f"{sys.executable} -m pip install -q -U 'transformers>=4.49,<5' accelerate fastapi 'uvicorn[standard]' python-multipart pillow pyngrok")
+sh(f"{sys.executable} -m pip install -q -U 'transformers>=4.49,<5' accelerate fastapi 'uvicorn[standard]' python-multipart pyngrok")
 
 # 公网隧道：cloudflared（免账号）
 CF = "/kaggle/working/cloudflared"

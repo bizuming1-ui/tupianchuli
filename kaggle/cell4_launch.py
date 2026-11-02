@@ -5,18 +5,24 @@ APP_DIR = "/kaggle/working/app"
 PORT = 8000
 os.chdir(APP_DIR)
 
-# ---- 可选：换更强的大模型（取消注释即可）----
-# 7B 在 T4 上需要两张卡切分(fp16 约 16GB)，吞吐更低但描述/判断更准:
-# os.environ["VLM_MODEL"] = "Qwen/Qwen2-VL-7B-Instruct"; os.environ["VLM_SHARD"] = "1"
-# 自定义涉政关键词（逗号分隔）:
+# ---- 可选：运行档位 PROFILE（取消注释即可）----
+# fast     : 只用 Qwen2-VL-2B（最快，吞吐最高）
+# balanced : 默认。Qwen2.5-VL-3B（更强），自检失败自动回退到 Qwen2-VL-2B；两张卡各一份，同时处理两张图
+# max      : Qwen2.5-VL-7B 两张卡切分（最准最慢；失败会依次回退 3B / 2B）
+# os.environ["PROFILE"] = "max"
+# 自定义涉政 / 涉黄关键词（逗号分隔）:
 # os.environ["POLITICAL_KEYWORDS"] = "词1,词2"
+# os.environ["PORN_KEYWORDS"] = "词1,词2"
+# 关闭某个辅助工具（排查问题时用）: DISABLE_OWL / DISABLE_NUDENET / DISABLE_OCR / DISABLE_TILES / DISABLE_VLM = "1"
 
 # 1) 先杀掉旧进程，避免端口占用
 subprocess.run("pkill -f '[a]pp/server.py' ; pkill -f '[c]loudflared' ; sleep 1", shell=True)  # [a] 写法避免 pkill 误杀自己
 
 # 2) 启动服务（后台），日志写入文件
 log = open("/kaggle/working/server.log", "w")
-env = dict(os.environ, PORT=str(PORT), HF_HUB_DISABLE_TELEMETRY="1", TOKENIZERS_PARALLELISM="false")
+# USE_TF/USE_FLAX=0：避免 transformers 去 import Kaggle 里版本冲突的 TensorFlow/Flax
+env = dict(os.environ, PORT=str(PORT), HF_HUB_DISABLE_TELEMETRY="1", TOKENIZERS_PARALLELISM="false",
+           USE_TF="0", USE_FLAX="0", PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
 server = subprocess.Popen([sys.executable, f"{APP_DIR}/server.py"], cwd=APP_DIR, stdout=log, stderr=subprocess.STDOUT, env=env)
 
 def health():
@@ -55,20 +61,29 @@ print("   ", public_url)
 print("   该网址本身就是一个完整的网页版审查系统，可直接打开使用")
 print("=" * 66)
 
-# 4) 等待模型加载（首次需要下载约 6~8GB，约 3~8 分钟）。两张 GPU 是【串行】加载的：GPU0 好了就能用，GPU1 在后台继续。
+def report(h):
+    m = h.get("models", {})
+    print(f"   分类器: {m.get('nsfw_all')} | CLIP: {m.get('clip')}")
+    print(f"   视觉大模型: {m.get('vlm')} | 目标检测: {m.get('detector')} | NudeNet: {m.get('nudenet')} | OCR: {m.get('ocr')}")
+    for g in h.get("gpu_stats", []):
+        mem = f"{g.get('mem_used_gb')}/{g.get('mem_total_gb')}GB" if "mem_used_gb" in g else "-"
+        print(f"   GPU{g['index']} {g['device']}: 就绪={g['ready']} 显存={mem} 大模型={g.get('vlm')}")
+
+# 4) 等待模型加载（首次需要下载约 8~12GB，约 4~10 分钟）。两张 GPU 是【串行】加载的：GPU0 好了就能用，GPU1 在后台继续。
 t0 = time.time()
 last = ""
 announced = False
-while time.time() - t0 < 1800:
+while time.time() - t0 < 2400:
     h = health()
     if h and h.get("ready"):
         if not announced:
             announced = True
-            print(f"✅ 可以使用了！已就绪 GPU 副本 {h['replicas_ready']}/{h['replicas']}，GPU: {[g['name'] for g in h['gpus']]}，大模型: {h['models']['vlm']}")
+            print(f"✅ 可以使用了！已就绪 GPU 副本 {h['replicas_ready']}/{h['replicas']}，GPU: {[g['name'] for g in h['gpus']]}")
         if h.get("loading_done"):
-            print(f"✅ 全部加载完成：副本 {h['replicas_ready']}/{h['replicas']}，大模型: {h['models']['vlm']}")
+            print(f"✅ 全部加载完成：副本 {h['replicas_ready']}/{h['replicas']}（v{h.get('version')} · {h.get('profile')}）")
+            report(h)
             for w in h.get("warnings") or []:
-                print("⚠️ 有副本加载失败（系统已自动降级继续运行）:", w)
+                print("⚠️ 降级/提示（系统已自动处理并继续运行）:", w)
             break
     elif h and h.get("error"):
         print("❌ 加载失败:", h["error"]); print(open('/kaggle/working/server.log').read()[-2500:]); break

@@ -7,7 +7,7 @@ REPO = "https://github.com/bizuming1-ui/tupianchuli"
 APP_DIR = "/kaggle/working/app"
 os.makedirs(APP_DIR, exist_ok=True)
 subprocess.run(f"rm -rf /kaggle/working/_repo && git clone --depth 1 {REPO} /kaggle/working/_repo", shell=True, check=True)
-for f in ("server.py", "crawler.py", "index.html", "crawl.html"):
+for f in ("server.py", "crawler.py", "videoframes.py", "report.py", "index.html", "crawl.html"):
     shutil.copy(f"/kaggle/working/_repo/kaggle/{f}", f"{APP_DIR}/{f}")
 print("✅ 已从 GitHub 同步:", sorted(os.listdir(APP_DIR)))
 for step in ("cell1_install.py", "cell4_launch.py"):  # 依次执行：安装依赖 → 启动服务

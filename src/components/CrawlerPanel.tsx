@@ -5,9 +5,10 @@ import {
   type CrawlForm, type CrawlItem, type CrawlView,
 } from "@/lib/crawl";
 import type { HealthInfo, Verdict } from "@/lib/types";
+import { buildExcel, downloadBlob, type ExcelRow } from "@/lib/excel";
 import { GpuPanel, ImageOverlay, InsightPanel } from "./Insights";
 
-type Filter = "all" | Verdict | "pending" | "error" | "screenshot";
+type Filter = "all" | Verdict | "pending" | "error" | "screenshot" | "frame" | "wall";
 
 const VERDICT_UI: Record<Verdict, { text: string; label: string; cls: string }> = {
   pass: { text: "✅ 通过", label: "通过", cls: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/40" },
@@ -21,10 +22,12 @@ const STATE_UI: Record<string, { text: string; cls: string }> = {
   stopped: { text: "■ 已停止", cls: "text-amber-300" },
   error: { text: "❌ 出错", cls: "text-red-300" },
 };
-const FORM_KEY = "crawl.form";
+const FORM_KEY = "crawl.form2"; // v2.2：默认值改为「视频画面」，换 key 让老用户也用上新默认
 
-const kindOf = (it: CrawlItem): Verdict | "pending" | "error" =>
-  it.res ? it.res.verdict : it.status === "error" || it.status === "skipped" ? "error" : "pending";
+const kindOf = (it: CrawlItem): Verdict | "pending" | "error" | "wall" =>
+  it.wall ? "wall" : it.res ? it.res.verdict : it.status === "error" || it.status === "skipped" ? "error" : "pending";
+
+const KIND_UI: Record<string, string> = { frame: "🎬 视频帧", cover: "🖼️ 封面", image: "🖼️ 图片", screenshot: "📸 截图" };
 
 function download(name: string, text: string, type: string) {
   const a = document.createElement("a");
@@ -76,21 +79,23 @@ const Card = memo(function Card({ it, api, job, onOpen }: { it: CrawlItem; api: 
   const k = kindOf(it);
   const res = it.res;
   return (
-    <button onClick={() => onOpen(it.idx)} className={`group overflow-hidden rounded-xl bg-slate-900 text-left ring-1 transition hover:ring-sky-400 ${k === "block" ? "ring-red-500/60" : k === "review" ? "ring-amber-500/50" : "ring-slate-800"}`}>
+    <button onClick={() => onOpen(it.idx)} className={`group overflow-hidden rounded-xl bg-slate-900 text-left ring-1 transition hover:ring-sky-400 ${k === "block" ? "ring-red-500/60" : k === "review" ? "ring-amber-500/50" : "ring-slate-800"} ${k === "wall" ? "opacity-60" : ""}`}>
       <NetImg api={api} job={job} idx={it.idx} thumb className="h-40 w-full bg-black" alt={it.name} />
       <div className="space-y-1 p-2.5">
         <div className="flex items-center justify-between gap-2">
-          {k === "pending" || k === "error" ? (
+          {k === "wall" ? (
+            <span className="rounded-md bg-slate-700/60 px-2 py-0.5 text-[11px] font-semibold text-slate-300 ring-1 ring-slate-600">🔒 登录墙(已排除)</span>
+          ) : k === "pending" || k === "error" ? (
             <span className={`rounded-md px-2 py-0.5 text-[11px] font-semibold ring-1 ${k === "error" ? "bg-red-500/10 text-red-300 ring-red-500/30" : "bg-slate-700/50 text-slate-300 ring-slate-600"}`}>
               {k === "error" ? (it.status === "skipped" ? "已取消" : "❌ 失败") : it.status === "running" ? "🔍 GPU 审核中" : "⏳ 排队"}
             </span>
           ) : (
             <span className={`rounded-md px-2 py-0.5 text-[11px] font-semibold ring-1 ${VERDICT_UI[k].cls}`}>{VERDICT_UI[k].text}</span>
           )}
-          <span className="text-[10px] text-slate-500">{it.kind === "screenshot" ? "📸 截图" : "🖼️ 图片"} {it.w}×{it.h}</span>
+          <span className="text-[10px] text-slate-500">{KIND_UI[it.kind] ?? "🖼️ 图片"}{it.ts != null ? ` ${it.ts}s` : ""} {it.w}×{it.h}</span>
         </div>
         <p className="line-clamp-2 min-h-[2rem] text-xs text-slate-300">{res ? res.description : it.err || "等待审核…"}</p>
-        {res && res.reasons.length > 0 && <p className="line-clamp-2 text-[11px] text-amber-300">{res.reasons[0]}</p>}
+        {res && k !== "wall" && res.reasons.length > 0 && <p className="line-clamp-2 text-[11px] text-amber-300">{res.reasons[0]}</p>}
         {res?.gpu && <p className="text-[10px] text-slate-600">{res.gpu}{res.cached ? " · 缓存" : ""}</p>}
       </div>
     </button>
@@ -138,12 +143,12 @@ function Detail({ it, list, api, job, onGo, onClose }: { it: CrawlItem; list: Cr
         </div>
         <div className="flex max-h-[55%] w-full flex-col gap-3 overflow-y-auto p-4 text-sm md:max-h-none md:w-[380px]">
           <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0 break-all text-xs text-slate-400">{it.kind === "screenshot" ? "📸 页面截图" : "🖼️ 网络图片"} · {it.w}×{it.h} · {(it.bytes / 1024).toFixed(0)}KB</div>
+            <div className="min-w-0 break-all text-xs text-slate-400">{it.kind === "screenshot" ? "📸 页面截图" : it.kind === "frame" ? `🎬 视频帧${it.ts != null ? `（第 ${it.ts} 秒）` : ""}` : it.kind === "cover" ? "🖼️ 视频封面" : "🖼️ 网络图片"} · {it.w}×{it.h} · {(it.bytes / 1024).toFixed(0)}KB</div>
             <button onClick={onClose} className="text-slate-400 hover:text-white">✕</button>
           </div>
           {res ? (
             <>
-              <div className={`inline-block self-start rounded-lg px-3 py-1 text-base font-bold ring-1 ${VERDICT_UI[res.verdict].cls}`}>{VERDICT_UI[res.verdict].text}</div>
+              {it.wall ? <div className="inline-block self-start rounded-lg bg-slate-700/60 px-3 py-1 text-base font-bold text-slate-200 ring-1 ring-slate-600">🔒 登录/验证码墙（已排除，不计入统计和 Excel）</div> : <div className={`inline-block self-start rounded-lg px-3 py-1 text-base font-bold ring-1 ${VERDICT_UI[res.verdict].cls}`}>{VERDICT_UI[res.verdict].text}</div>}
               <p className="text-base leading-snug text-white">{res.description}</p>
               {res.reasons.length > 0 && <ul className="space-y-1 rounded-lg bg-slate-800/70 p-3 text-xs text-amber-200">{res.reasons.map((r) => <li key={r}>• {r}</li>)}</ul>}
               <div className="space-y-1.5 rounded-lg bg-slate-800/50 p-3">
@@ -160,6 +165,7 @@ function Detail({ it, list, api, job, onGo, onClose }: { it: CrawlItem; list: Cr
           )}
           <div className="space-y-1 border-t border-slate-800 pt-3 text-[11px] text-slate-400">
             <div>来源页：<a href={it.page} target="_blank" rel="noreferrer" className="break-all text-sky-300 underline decoration-dotted">{it.page}</a></div>
+            {it.kind === "frame" && it.video && <div>视频地址：<span className="break-all text-slate-300">{it.video}</span></div>}
             {it.kind === "image" && <div>图片地址：<a href={it.src} target="_blank" rel="noreferrer" className="break-all text-sky-300 underline decoration-dotted">{it.src}</a></div>}
           </div>
         </div>
@@ -312,16 +318,19 @@ export default function CrawlerPanel({ onBack }: { onBack: () => void }) {
   };
 
   const counts = useMemo(() => {
-    const c = { all: items.length, pass: 0, review: 0, block: 0, pending: 0, error: 0, screenshot: 0 };
+    const c = { all: 0, pass: 0, review: 0, block: 0, pending: 0, error: 0, screenshot: 0, frame: 0, wall: 0 };
     for (const it of items) {
       c[kindOf(it)]++;
+      if (it.wall) continue;
+      c.all++;
       if (it.kind === "screenshot") c.screenshot++;
+      if (it.kind === "frame") c.frame++;
     }
     return c;
   }, [items]);
 
   const filtered = useMemo(() => {
-    let l = items.filter((i) => (filter === "all" ? true : filter === "screenshot" ? i.kind === "screenshot" : kindOf(i) === filter));
+    let l = items.filter((i) => (filter === "all" ? !i.wall : filter === "screenshot" ? i.kind === "screenshot" && !i.wall : filter === "frame" ? i.kind === "frame" && !i.wall : kindOf(i) === filter));
     l = l.slice().sort((a, b) => {
       if (!sortRisk) return a.idx - b.idx;
       const w = (i: CrawlItem) => (i.res ? (i.res.verdict === "block" ? 3 : i.res.verdict === "review" ? 2 : 1) * 10 + Math.max(i.res.porn.score, i.res.political.score) : 0);
@@ -338,9 +347,38 @@ export default function CrawlerPanel({ onBack }: { onBack: () => void }) {
     const rows = [["序号", "类型", "结论", "涉黄分", "涉政分", "描述", "原因", "图中文字", "图片地址", "来源页", "GPU"].map(q).join(",")];
     for (const it of items) {
       const r = it.res;
-      rows.push([it.idx, it.kind === "screenshot" ? "截图" : "图片", r ? VERDICT_UI[r.verdict].label : it.status, r?.porn.score ?? "", r?.political.score ?? "", r?.description ?? it.err ?? "", (r?.reasons ?? []).join("；"), r?.ocr_text ?? "", it.kind === "image" ? it.src : "", it.page, r?.gpu ?? ""].map(q).join(","));
+      rows.push([it.idx, ({ screenshot: "截图", frame: "视频帧", cover: "视频封面", image: "图片" } as Record<string, string>)[it.kind] ?? "图片", it.wall ? "登录墙(已排除)" : r ? VERDICT_UI[r.verdict].label : it.status, r?.porn.score ?? "", r?.political.score ?? "", r?.description ?? it.err ?? "", (r?.reasons ?? []).join("；"), r?.ocr_text ?? "", it.kind === "image" ? it.src : "", it.page, r?.gpu ?? ""].map(q).join(","));
     }
     download(`爬取审核结果-${new Date().toISOString().slice(0, 10)}.csv`, "\ufeff" + rows.join("\n"), "text/csv;charset=utf-8");
+  };
+
+  const [xlsxBusy, setXlsxBusy] = useState(false);
+  const exportExcel = async () => {
+    const done = items.filter((i) => i.res && !i.wall);
+    if (!done.length || !job) return;
+    setXlsxBusy(true);
+    try {
+      const rows: ExcelRow[] = [];
+      for (const it of done.slice().sort((a, b) => a.idx - b.idx)) {
+        let image: Blob | null = null;
+        try {
+          const u = await crawlImage(api, job, it.idx, true);
+          image = await (await fetch(u)).blob();
+        } catch {
+          image = null;
+        }
+        rows.push({ idx: it.idx + 1, kind: it.kind, name: it.name, res: it.res, page: it.page, src: it.src, video: it.video, ts: it.ts, title: it.title, image });
+      }
+      const st = view?.stats;
+      const blob = await buildExcel(rows, {
+        title: "网络照片自动爬取审核报告", platform: plat.name, urls: view?.params?.urls, keyword: form.keyword, mode: view?.params?.mode ?? form.mode,
+        elapsed: view?.elapsed, videos: st?.videos, frames: st?.frames, walls: st?.walls,
+      });
+      downloadBlob(`爬取审核报告-${new Date().toISOString().slice(0, 10)}.xlsx`, blob);
+    } catch (e) {
+      setErr(e instanceof Error ? `生成 Excel 失败：${e.message}` : "生成 Excel 失败");
+    }
+    setXlsxBusy(false);
   };
 
   const s = view?.stats;
@@ -354,7 +392,7 @@ export default function CrawlerPanel({ onBack }: { onBack: () => void }) {
     : { cls: "bg-slate-700/50 text-slate-300 ring-slate-600", text: "未连接 GPU" };
   const btn = "rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 ring-1 ring-slate-700 transition hover:bg-slate-700 active:scale-95 disabled:opacity-40";
   const tabs: [Filter, string][] = [
-    ["all", "全部"], ["block", "🚫 拦截"], ["review", "⚠️ 待复核"], ["pass", "✅ 通过"], ["pending", "⏳ 处理中"], ["screenshot", "📸 截图"], ["error", "❌ 失败/取消"],
+    ["all", "全部"], ["block", "🚫 拦截"], ["review", "⚠️ 待复核"], ["pass", "✅ 通过"], ["pending", "⏳ 处理中"], ["frame", "🎬 视频帧"], ["screenshot", "📸 截图"], ["wall", "🔒 登录墙(已排除)"], ["error", "❌ 失败/取消"],
   ];
 
   return (
@@ -407,10 +445,19 @@ export default function CrawlerPanel({ onBack }: { onBack: () => void }) {
                 <input value={form.keyword} onChange={(e) => set("keyword", e.target.value)} placeholder="例如：穿搭" className={inp} />
               </div>
               <div className="grid grid-cols-3 gap-2">
-                {([["both", "图片+截图"], ["images", "仅抓图"], ["screenshot", "仅截图"]] as const).map(([m, t]) => (
+                {([["video", "🎬 视频画面(推荐)"], ["all", "视频+图片+截图"], ["both", "图片+截图(旧)"], ["images", "仅抓图"], ["screenshot", "仅截图"]] as const).map(([m, t]) => (
                   <button key={m} onClick={() => set("mode", m)} className={`rounded-lg px-2 py-2 text-xs ring-1 ${form.mode === m ? "bg-emerald-500/20 text-emerald-200 ring-emerald-400/60" : "bg-slate-800 text-slate-300 ring-slate-700 hover:bg-slate-700"}`}>{t}</button>
                 ))}
               </div>
+              {(form.mode === "video" || form.mode === "all") && (
+                <div className="space-y-2 rounded-lg bg-sky-500/5 p-2.5 ring-1 ring-sky-500/20">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div><label className={lab}>每个视频抽几帧</label><input type="number" min={1} max={24} value={form.frames_per_video} onChange={(e) => set("frames_per_video", Number(e.target.value) || 6)} className={inp} /></div>
+                    <div><label className={lab}>最多处理视频数</label><input type="number" min={1} max={60} value={form.video_limit} onChange={(e) => set("video_limit", Number(e.target.value) || 10)} className={inp} /></div>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-sky-200/80">视频画面模式：找到视频流 → ffmpeg 抽帧 → 每帧送 T4×2 审核；登录弹窗、二维码、头像等界面图自动过滤。最稳的用法：直接粘贴【具体的视频链接】（抖音 / B站走公开解析，不用登录）。搜索页/推荐页多数平台要求登录，请改用你自己账号的 Cookie。</p>
+                </div>
+              )}
               <div className="grid grid-cols-3 gap-2">
                 <div><label className={lab}>最多张数</label><input type="number" min={1} max={600} value={form.max_images} onChange={(e) => set("max_images", Number(e.target.value) || 1)} className={inp} /></div>
                 <div><label className={lab}>滚动屏数</label><input type="number" min={0} max={60} value={form.scrolls} onChange={(e) => set("scrolls", Number(e.target.value) || 0)} className={inp} /></div>
@@ -418,7 +465,7 @@ export default function CrawlerPanel({ onBack }: { onBack: () => void }) {
                   <select value={form.analyze_mode} onChange={(e) => set("analyze_mode", e.target.value as "full" | "fast")} className={inp}><option value="full">精准</option><option value="fast">快速</option></select>
                 </div>
               </div>
-              <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300"><input type="checkbox" checked={form.deep} onChange={(e) => set("deep", e.target.checked)} /> 深入作品详情（从列表页逐个打开作品再抓，更全更慢）</label>
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300"><input type="checkbox" checked={form.deep} onChange={(e) => set("deep", e.target.checked)} /> 深入作品详情（从搜索页/主页逐个打开作品；视频模式下自动开启）</label>
               <button onClick={() => setAdv((v) => !v)} className="text-[11px] text-sky-300 hover:underline">{adv ? "▾ 收起高级选项" : "▸ 高级选项（Cookie / 手机端 / 最小尺寸 / 间隔）"}</button>
               {adv && (
                 <div className="space-y-2 rounded-lg bg-slate-800/50 p-3">
@@ -429,7 +476,7 @@ export default function CrawlerPanel({ onBack }: { onBack: () => void }) {
                   </div>
                   <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300"><input type="checkbox" checked={form.mobile} onChange={(e) => set("mobile", e.target.checked)} /> 模拟手机端页面（竖屏截图，部分平台手机页更易访问）</label>
                   <div>
-                    <label className={lab}>Cookie（可选：你自己账号的登录态；只在服务端内存中使用，不保存、不写日志）</label>
+                    <label className={lab}>Cookie（可选：你自己账号的登录态，支持 a=1; b=2 / Cookie-Editor 导出的 JSON / cookies.txt；只在服务端内存中使用，不保存、不写日志）</label>
                     <input type="password" value={form.cookie} onChange={(e) => set("cookie", e.target.value)} placeholder="a=1; b=2" className={`${inp} font-mono`} autoComplete="off" />
                   </div>
                 </div>
@@ -449,17 +496,20 @@ export default function CrawlerPanel({ onBack }: { onBack: () => void }) {
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
                 <b className={`text-sm ${view ? STATE_UI[view.state].cls : "text-slate-400"}`}>{view ? STATE_UI[view.state].text : "尚未开始"}</b>
                 {view && <span className="text-xs text-slate-500">用时 {view.elapsed}s · 引擎 {view.engine === "playwright" ? "Chromium" : view.engine || "-"} · 审核并发 {view.conc} · 待审 {view.pending}</span>}
-                <div className="ml-auto flex gap-2"><button onClick={exportCsv} disabled={!items.length} className={btn}>导出 CSV</button></div>
+                <div className="ml-auto flex gap-2">
+                  <button onClick={exportExcel} disabled={!items.some((i) => i.res && !i.wall) || xlsxBusy} title="生成 Excel：含缩略图、涉政/涉黄/暴力等违规类别、汇总" className="rounded-lg bg-green-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-lg shadow-green-900/40 transition hover:bg-green-500 active:scale-95 disabled:opacity-40">{xlsxBusy ? "生成中…" : "📊 生成 Excel"}</button>
+                  <button onClick={exportCsv} disabled={!items.length} className={btn}>导出 CSV</button>
+                </div>
               </div>
               {s && (
-                <div className="grid grid-cols-3 gap-2 text-center text-xs sm:grid-cols-6">
-                  {([["抓到图片", s.found, "text-sky-300"], ["页面截图", s.screenshots, "text-sky-300"], ["已审核", s.analyzed, "text-slate-200"], ["拦截", s.block, "text-red-300"], ["待复核", s.review, "text-amber-300"], ["通过", s.pass, "text-emerald-300"]] as const).map(([t, v, c]) => (
+                <div className="grid grid-cols-3 gap-2 text-center text-xs sm:grid-cols-4 lg:grid-cols-7">
+                  {([["视频数", s.videos ?? 0, "text-violet-300"], ["视频帧", s.frames ?? 0, "text-sky-300"], ["图片/截图", s.found + s.screenshots, "text-sky-300"], ["已审核", s.analyzed, "text-slate-200"], ["拦截", s.block, "text-red-300"], ["待复核", s.review, "text-amber-300"], ["通过", s.pass, "text-emerald-300"]] as const).map(([t, v, c]) => (
                     <div key={t} className="rounded-lg bg-slate-800/70 py-2"><div className={`text-lg font-bold ${c}`}>{v}</div><div className="text-[10px] text-slate-500">{t}</div></div>
                   ))}
                 </div>
               )}
               <div className="h-1.5 overflow-hidden rounded-full bg-slate-800"><div className="h-full bg-gradient-to-r from-sky-400 to-emerald-400 transition-all" style={{ width: `${pct}%` }} /></div>
-              {s && <div className="text-[11px] text-slate-500">已过滤：重复 {s.dup} · 过小/非图片 {s.small} · 失败 {s.errors}{view?.cap_hit ? " · 已达到最多张数上限" : ""}{view && Object.keys(view.gpu_count).length > 0 ? ` · 各卡完成数：${Object.entries(view.gpu_count).map(([k, v]) => `${k.replace(/^.*?(cuda:\d|mock:\d)/, "$1")}=${v}`).join(" / ")}` : ""}</div>}
+              {s && <div className="text-[11px] text-slate-500">已过滤：重复 {s.dup} · 过小/非图片 {s.small} · 界面图 {s.ui ?? 0} · 登录墙截图 {s.walls ?? 0} · 被遮挡页面 {s.wall_pages ?? 0} · 抽帧失败 {s.video_fail ?? 0} · 失败 {s.errors}{view?.cap_hit ? " · 已达到最多张数上限" : ""}{view && Object.keys(view.gpu_count).length > 0 ? ` · 各卡完成数：${Object.entries(view.gpu_count).map(([k, v]) => `${k.replace(/^.*?(cuda:\d|mock:\d)/, "$1")}=${v}`).join(" / ")}` : ""}</div>}
               {health && online === "online" ? <GpuPanel health={health} /> : <div className="rounded-lg bg-slate-800/40 p-3 text-xs text-slate-500">连接后这里实时显示两张 T4 的忙/闲、显存和已处理数量。</div>}
               <div ref={logRef} className="max-h-36 overflow-y-auto whitespace-pre-wrap rounded-lg bg-black/40 p-2.5 font-mono text-[11px] leading-relaxed text-slate-400">{view?.logs?.length ? view.logs.join("\n") : "运行日志会显示在这里…"}</div>
             </section>

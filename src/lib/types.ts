@@ -99,6 +99,8 @@ export interface HealthInfo {
   error: string | null;
   warnings?: string[];
   loading_done?: boolean;
+  /** v2.1：爬取模块能力（playwright/chromium 是否可用） */
+  crawler?: { playwright: boolean; chromium: boolean; engine: string };
 }
 
 export type ItemStatus = "queued" | "running" | "done" | "error";

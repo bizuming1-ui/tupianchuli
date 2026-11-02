@@ -1,5 +1,6 @@
-# ===== 方案 B（可选）：已把代码推送到 GitHub 后，用这一个 Cell 代替 Cell 2 + Cell 3 =====
-# 作用：从 GitHub 仓库拉取 kaggle/server.py 与 kaggle/index.html 到 /kaggle/working/app
+# ===== 方案 B：GitHub 同步版（先把最新代码更新到 GitHub，之后只需要这一个 Cell）=====
+# 前置：Settings → Accelerator 选 GPU T4 x2；Internet 打开 On
+# 作用：从 GitHub 拉最新代码 → 安装依赖 → 启动 GPU 服务 → 生成公网网址
 import os, shutil, subprocess
 
 REPO = "https://github.com/bizuming1-ui/tupianchuli"
@@ -8,4 +9,7 @@ os.makedirs(APP_DIR, exist_ok=True)
 subprocess.run(f"rm -rf /kaggle/working/_repo && git clone --depth 1 {REPO} /kaggle/working/_repo", shell=True, check=True)
 for f in ("server.py", "index.html"):
     shutil.copy(f"/kaggle/working/_repo/kaggle/{f}", f"{APP_DIR}/{f}")
-print("✅ 已从 GitHub 同步:", os.listdir(APP_DIR))
+print("✅ 已从 GitHub 同步:", sorted(os.listdir(APP_DIR)))
+for step in ("cell1_install.py", "cell4_launch.py"):  # 依次执行：安装依赖 → 启动服务
+    path = f"/kaggle/working/_repo/kaggle/{step}"
+    exec(compile(open(path, encoding="utf-8").read(), path, "exec"), globals())

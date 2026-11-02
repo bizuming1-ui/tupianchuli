@@ -36,6 +36,13 @@ if not have("nudenet"):
 if not have("rapidocr_onnxruntime"):
     sh(f"{PY} -m pip install -q --no-deps rapidocr_onnxruntime")
 
+# 2.5) v2.1 网络照片爬取：Playwright + Chromium（同样是可选增强：装不上时爬取自动降级为 HTTP 模式，审核功能不受影响）
+#      Kaggle 以 root 运行，install-deps 会用 apt 装好 Chromium 需要的系统库（约 1~2 分钟，只需一次）
+if not have("playwright"):
+    sh(f"{PY} -m pip install -q playwright")
+sh(f"{PY} -m playwright install chromium")
+sh(f"{PY} -m playwright install-deps chromium", tail=600)
+
 # 3) 公网隧道：cloudflared（免账号）
 CF = "/kaggle/working/cloudflared"
 if not os.path.exists(CF):
@@ -56,4 +63,9 @@ chk = subprocess.run([PY, "-c", "import transformers,cv2,numpy;print(transformer
 print("transformers / cv2 / numpy:", (chk.stdout or chk.stderr).strip()[-200:])
 for mod, label in (("nudenet", "NudeNet 身体部位检测"), ("rapidocr_onnxruntime", "RapidOCR 文字识别"), ("cv2", "OpenCV 二维码")):
     print(("✅" if have(mod) else "⚠️ 缺失(将自动降级)"), label)
+# 浏览器自检：真的启动一次 Chromium 并打开 about:blank，确认「自动爬取」可用
+_t = subprocess.run([PY, "-c", "from playwright.sync_api import sync_playwright as s\n"
+                     "with s() as p:\n b=p.chromium.launch(args=['--no-sandbox','--disable-dev-shm-usage']);pg=b.new_page();pg.goto('about:blank');b.close()\nprint('ok')"],
+                    capture_output=True, text=True)
+print("✅ Chromium 浏览器（网络照片自动爬取）" if "ok" in (_t.stdout or "") else "⚠️ Chromium 不可用（爬取将降级为 HTTP 模式）: " + ((_t.stderr or "")[-300:]))
 print("✅ Cell 1 完成：下一步运行启动 Cell")
